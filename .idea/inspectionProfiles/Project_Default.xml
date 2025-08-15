@@ -1,0 +1,143 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="CssUnknownProperty" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="myCustomPropertiesEnabled" value="true" />
+      <option name="myIgnoreVendorSpecificProperties" value="false" />
+      <option name="myCustomPropertiesList">
+        <value>
+          <list size="1">
+            <item index="0" class="java.lang.String" itemvalue="scrollbar-width" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="DuplicatedCode" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <Languages>
+        <language minSize="75" name="JavaScript" />
+        <language minSize="68" name="Python" />
+      </Languages>
+    </inspection_tool>
+    <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="HtmlUnknownAttribute" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="myValues">
+        <value>
+          <list size="1">
+            <item index="0" class="java.lang.String" itemvalue="webkit-playsinline" />
+          </list>
+        </value>
+      </option>
+      <option name="myCustomValuesEnabled" value="true" />
+    </inspection_tool>
+    <inspection_tool class="HtmlUnknownTag" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="myValues">
+        <value>
+          <list size="12">
+            <item index="0" class="java.lang.String" itemvalue="nobr" />
+            <item index="1" class="java.lang.String" itemvalue="noembed" />
+            <item index="2" class="java.lang.String" itemvalue="comment" />
+            <item index="3" class="java.lang.String" itemvalue="noscript" />
+            <item index="4" class="java.lang.String" itemvalue="embed" />
+            <item index="5" class="java.lang.String" itemvalue="script" />
+            <item index="6" class="java.lang.String" itemvalue="bs-book" />
+            <item index="7" class="java.lang.String" itemvalue="app-bs-trophy" />
+            <item index="8" class="java.lang.String" itemvalue="app-bs-share" />
+            <item index="9" class="java.lang.String" itemvalue="app-bs-cart3" />
+            <item index="10" class="java.lang.String" itemvalue="app-bs-envelope" />
+            <item index="11" class="java.lang.String" itemvalue="app-bs-book" />
+          </list>
+        </value>
+      </option>
+      <option name="myCustomValuesEnabled" value="true" />
+    </inspection_tool>
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="65">
+            <item index="0" class="java.lang.String" itemvalue="absl-py" />
+            <item index="1" class="java.lang.String" itemvalue="google-pasta" />
+            <item index="2" class="java.lang.String" itemvalue="protobuf" />
+            <item index="3" class="java.lang.String" itemvalue="rsa" />
+            <item index="4" class="java.lang.String" itemvalue="joblib" />
+            <item index="5" class="java.lang.String" itemvalue="opt-einsum" />
+            <item index="6" class="java.lang.String" itemvalue="scikit-learn" />
+            <item index="7" class="java.lang.String" itemvalue="Click" />
+            <item index="8" class="java.lang.String" itemvalue="gast" />
+            <item index="9" class="java.lang.String" itemvalue="MarkupSafe" />
+            <item index="10" class="java.lang.String" itemvalue="numpy" />
+            <item index="11" class="java.lang.String" itemvalue="requests" />
+            <item index="12" class="java.lang.String" itemvalue="Jinja2" />
+            <item index="13" class="java.lang.String" itemvalue="pyasn1-modules" />
+            <item index="14" class="java.lang.String" itemvalue="requests-oauthlib" />
+            <item index="15" class="java.lang.String" itemvalue="Keras-Preprocessing" />
+            <item index="16" class="java.lang.String" itemvalue="tensorflow" />
+            <item index="17" class="java.lang.String" itemvalue="certifi" />
+            <item index="18" class="java.lang.String" itemvalue="oauthlib" />
+            <item index="19" class="java.lang.String" itemvalue="urllib3" />
+            <item index="20" class="java.lang.String" itemvalue="itsdangerous" />
+            <item index="21" class="java.lang.String" itemvalue="Markdown" />
+            <item index="22" class="java.lang.String" itemvalue="Flask" />
+            <item index="23" class="java.lang.String" itemvalue="scipy" />
+            <item index="24" class="java.lang.String" itemvalue="wincertstore" />
+            <item index="25" class="java.lang.String" itemvalue="six" />
+            <item index="26" class="java.lang.String" itemvalue="google-auth-oauthlib" />
+            <item index="27" class="java.lang.String" itemvalue="Werkzeug" />
+            <item index="28" class="java.lang.String" itemvalue="h5py" />
+            <item index="29" class="java.lang.String" itemvalue="Flask-WTF" />
+            <item index="30" class="java.lang.String" itemvalue="wrapt" />
+            <item index="31" class="java.lang.String" itemvalue="astor" />
+            <item index="32" class="java.lang.String" itemvalue="gunicorn" />
+            <item index="33" class="java.lang.String" itemvalue="Keras-Applications" />
+            <item index="34" class="java.lang.String" itemvalue="chardet" />
+            <item index="35" class="java.lang.String" itemvalue="termcolor" />
+            <item index="36" class="java.lang.String" itemvalue="WTForms" />
+            <item index="37" class="java.lang.String" itemvalue="cachetools" />
+            <item index="38" class="java.lang.String" itemvalue="grpcio" />
+            <item index="39" class="java.lang.String" itemvalue="google-auth" />
+            <item index="40" class="java.lang.String" itemvalue="idna" />
+            <item index="41" class="java.lang.String" itemvalue="tiktoken" />
+            <item index="42" class="java.lang.String" itemvalue="pytest-playwright" />
+            <item index="43" class="java.lang.String" itemvalue="xhtml2pdf" />
+            <item index="44" class="java.lang.String" itemvalue="markdownify" />
+            <item index="45" class="java.lang.String" itemvalue="keybert" />
+            <item index="46" class="java.lang.String" itemvalue="netlify-py" />
+            <item index="47" class="java.lang.String" itemvalue="google-generativeai" />
+            <item index="48" class="java.lang.String" itemvalue="eventlet" />
+            <item index="49" class="java.lang.String" itemvalue="playwright" />
+            <item index="50" class="java.lang.String" itemvalue="flask-cors" />
+            <item index="51" class="java.lang.String" itemvalue="anthropic" />
+            <item index="52" class="java.lang.String" itemvalue="sqlmodel" />
+            <item index="53" class="java.lang.String" itemvalue="GitPython" />
+            <item index="54" class="java.lang.String" itemvalue="fastlogging" />
+            <item index="55" class="java.lang.String" itemvalue="ollama" />
+            <item index="56" class="java.lang.String" itemvalue="mistletoe" />
+            <item index="57" class="java.lang.String" itemvalue="toml" />
+            <item index="58" class="java.lang.String" itemvalue="openai" />
+            <item index="59" class="java.lang.String" itemvalue="pdfminer.six" />
+            <item index="60" class="java.lang.String" itemvalue="colorama" />
+            <item index="61" class="java.lang.String" itemvalue="mistralai" />
+            <item index="62" class="java.lang.String" itemvalue="Flask-SocketIO" />
+            <item index="63" class="java.lang.String" itemvalue="rank_bm25" />
+            <item index="64" class="java.lang.String" itemvalue="flask" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8NamingInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="N802" />
+          <option value="N813" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="tensorflow.compat" />
+          <option value="dict.encode" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
