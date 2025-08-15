@@ -151,7 +151,7 @@ app.get('/api/health', (req, res) => {
   console.log('❤️  Health check requested');
   res.json({ 
     status: 'ok', 
-    timestamp: getCurrentUTCTimestamp(),
+    timestamp: new Date().toISOString(),
     user: 'darrassipro'
   });
 });
@@ -177,12 +177,6 @@ app.use('*', (req, res, next) => {
     ]
   });
 });
-
-// Helper function to generate timestamp in the requested format
-function getCurrentUTCTimestamp() {
-  const now = new Date();
-  return ${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')};
-}
 
 // Error handling middleware with detailed logging
 app.use((error, req, res, next) => {
