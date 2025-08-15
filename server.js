@@ -24,32 +24,18 @@ try {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const allowedOrigins = [
-  'https://smtp-send-ui.vercel.app'
-];
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, Postman, etc.)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== 'production') {
-      callback(null, true);
-    } else {
-      console.log('CORS blocked request from:', origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-  credentials: true,
-  optionsSuccessStatus: 204
-};
 
 // Middleware
-app.use(cors(corsOptions));
+app.use(cors({
+  origin: ['https://smtp-send-ui.vercel.app', 'http://smtp-send-ui.vercel.app'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.options('*', cors(corsOptions));
+
 
 // Routes
 app.use('/api/smtp-config', require('./controllers/smtp.controller'));
@@ -84,3 +70,4 @@ if (process.env.NODE_ENV !== 'production') {
 
 // THIS IS CRITICAL FOR VERCEL DEPLOYMENT - MUST EXPORT THE APP
 module.exports = app;
+
