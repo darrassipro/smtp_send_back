@@ -48,7 +48,7 @@ app.use((req, res, next) => {
 
 // Middleware
 const corsOptions = {
-  origin: ['https://smtp-send-ui.vercel.app', 'http://smtp-send-ui.vercel.app'],
+  origin: ['https://smtp-send-ui.vercel.app', 'http://smtp-send-ui.vercel.app', 'http://localhost:4200'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -77,7 +77,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Log all routes being registered
 console.log('🛣️  Registering routes...');
 
-// Route registration with logging
+// Route registration with logging and fallback
 try {
   console.log('📝 Registering /api/smtp-config routes...');
   const smtpController = require('./controllers/smtp.controller');
@@ -85,6 +85,14 @@ try {
   console.log('✅ SMTP controller loaded successfully');
 } catch (error) {
   console.error('❌ Error loading SMTP controller:', error);
+  // Create fallback route
+  app.post('/api/smtp-config/*', (req, res) => {
+    console.error('⚠️ SMTP controller not loaded, using fallback');
+    res.status(500).json({
+      error: 'SMTP controller not available',
+      message: error.message
+    });
+  });
 }
 
 try {
@@ -94,6 +102,14 @@ try {
   console.log('✅ Email controller loaded successfully');
 } catch (error) {
   console.error('❌ Error loading Email controller:', error);
+  // Create fallback route
+  app.post('/api/send/*', (req, res) => {
+    console.error('⚠️ Email controller not loaded, using fallback');
+    res.status(500).json({
+      error: 'Email controller not available',
+      message: error.message
+    });
+  });
 }
 
 try {
@@ -103,6 +119,14 @@ try {
   console.log('✅ Draft controller loaded successfully');
 } catch (error) {
   console.error('❌ Error loading Draft controller:', error);
+  // Create fallback route
+  app.use('/api/drafts/*', (req, res) => {
+    console.error('⚠️ Draft controller not loaded, using fallback');
+    res.status(500).json({
+      error: 'Draft controller not available',
+      message: error.message
+    });
+  });
 }
 
 try {
@@ -112,6 +136,14 @@ try {
   console.log('✅ Attachment controller loaded successfully');
 } catch (error) {
   console.error('❌ Error loading Attachment controller:', error);
+  // Create fallback route
+  app.use('/api/attachments/*', (req, res) => {
+    console.error('⚠️ Attachment controller not loaded, using fallback');
+    res.status(500).json({
+      error: 'Attachment controller not available',
+      message: error.message
+    });
+  });
 }
 
 // Health check
@@ -159,12 +191,20 @@ app.use((error, req, res, next) => {
   console.error('  Stack:', error.stack);
   console.error('  Request:', req.method, req.originalUrl);
   
-  if (errorHandler) {
-    errorHandler(error, req, res, next);
-  } else {
+  try {
+    if (errorHandler) {
+      errorHandler(error, req, res, next);
+    } else {
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  } catch (handlerError) {
+    console.error('💥 Error handler also failed:', handlerError);
     res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
+      error: 'Critical server error',
+      message: 'Multiple error handler failures'
     });
   }
 });
