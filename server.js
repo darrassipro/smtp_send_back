@@ -206,7 +206,7 @@ app.use((error, req, res, next) => {
 // Start server - ONLY for local development
 if (process.env.NODE_ENV !== 'production') {
   app.listen(PORT, () => {
-    console.log(🎉 Server running on port ${PORT});
+    console.log('🎉 Server running on port', PORT);
   });
 } else {
   console.log('🚀 Production mode - server will be handled by Vercel');
