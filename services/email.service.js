@@ -91,7 +91,7 @@ class EmailService {
     // Attachments
     if (emailData.attachments && emailData.attachments.length > 0) {
       mailOptions.attachments = await Promise.all(emailData.attachments.map(async (attachment) => {
-        const filePath = path.join(__dirname, '../uploads', attachment.filename);
+        const filePath = path.join('/tmp', attachment.filename);
         try {
           await fs.access(filePath);
         } catch (err) {
@@ -118,7 +118,7 @@ class EmailService {
       if (emailData.attachments && emailData.attachments.length > 0) {
         for (const attachment of emailData.attachments) {
           try {
-            const filePath = path.join(__dirname, '../uploads', attachment.filename);
+            const filePath = path.join('/tmp', attachment.filename);
             await fs.unlink(filePath);
           } catch (err) {
             console.error(`Error deleting attachment ${attachment.filename}:`, err);
@@ -166,3 +166,4 @@ class EmailService {
 }
 
 module.exports = new EmailService();
+
