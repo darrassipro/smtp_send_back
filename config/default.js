@@ -6,7 +6,7 @@ module.exports = {
   smtp: {
     // Default SMTP config (will be overridden by admin)
     host: '',
-    port: 587,
+    port: 465,
     secure: false,
     auth: {
       user: '',
@@ -14,4 +14,5 @@ module.exports = {
     },
     from: ''
   }
+
 };
