@@ -34,17 +34,16 @@ router.delete('/:id', asyncHandler(async (req, res) => {
   }
 
   // If draft has attachments, delete them
-  if (draft.attachments && draft.attachments.length > 0) {
-    for (const attachment of draft.attachments) {
-      try {
-        await fs.unlink(path.join(__dirname, '../uploads', attachment.filename));
-        console.log(`Deleted attachment from draft: ${attachment.filename}`);
-      } catch (err) {
-        console.error(`Error deleting attachment ${attachment.filename}:`, err);
-        // Continue even if file deletion fails
-      }
+  if (draft.attachments?.length > 0) {
+  for (const attachment of draft.attachments) {
+    try {
+      await fs.unlink(path.join('/tmp', attachment.filename));
+      console.log(`Deleted attachment: ${attachment.filename}`);
+    } catch (err) {
+      console.error(`Failed to delete attachment ${attachment.filename}:`, err);
     }
   }
+}
 
   res.json({ success: true, id });
 }));
