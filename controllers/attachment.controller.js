@@ -6,29 +6,28 @@ const path = require('path');
 const fs = require('fs').promises;
 const { v4: uuidv4 } = require('uuid');
 
-// Configure multer for file uploads
+// Multer storage for Vercel-compatible temp folder
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, path.join(__dirname, '../uploads'));
+    cb(null, '/tmp'); // Vercel allows only /tmp for write access
   },
   filename: function (req, file, cb) {
-    // Generate unique filename to prevent collisions
     const uniqueFilename = `${uuidv4()}${path.extname(file.originalname)}`;
     cb(null, uniqueFilename);
   }
 });
 
-// Create multer upload instance
 const upload = multer({
   storage: storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB file size limit
-  }
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
 });
 
-// Upload a file
+// Upload file endpoint
 router.post('/', upload.single('file'), asyncHandler(async (req, res) => {
+  console.log('Incoming file upload:', req.file);
+
   if (!req.file) {
+    console.error('No file uploaded!');
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
@@ -40,14 +39,16 @@ router.post('/', upload.single('file'), asyncHandler(async (req, res) => {
   });
 }));
 
-// Delete a file
+// Delete file endpoint (temporary folder)
 router.delete('/:filename', asyncHandler(async (req, res) => {
   const { filename } = req.params;
+  const filePath = path.join('/tmp', filename);
 
   try {
-    await fs.unlink(path.join(__dirname, '../uploads', filename));
+    await fs.unlink(filePath);
     res.json({ success: true, filename });
   } catch (error) {
+    console.error('Delete file error:', error);
     if (error.code === 'ENOENT') {
       return res.status(404).json({ error: 'File not found' });
     }
