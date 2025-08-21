@@ -30,6 +30,10 @@ app.use('/api/send', require('./controllers/email.controller'));
 app.use('/api/drafts', require('./controllers/draft.controller'));
 app.use('/api/attachments', require('./controllers/attachment.controller')); // uses /tmp internally
 
+// Root endpoint
+app.get('/', (req, res) => {
+  res.send('Server is up and running 🚀');
+});
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -42,3 +46,4 @@ app.use(errorHandler);
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
