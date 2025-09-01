@@ -1,5 +1,5 @@
 /**
- * Scraping Controller (Bing-based)
+ * Scraping Controller (DuckDuckGo-based)
  * Provides two endpoints:
  *  - GET /api/scraping/search      (paginated single search page)
  *  - GET /api/scraping/search-all  (multi-page comprehensive search)
@@ -8,13 +8,18 @@
  *  ScrapingResponse & ComprehensiveScrapingResponse
  *
  * Key Features:
- *  - Multiple adaptive Bing queries (HR focused if hrFocus=true)
+ *  - Multiple adaptive DuckDuckGo queries (HR focused if hrFocus=true)
+ *  - Robust result link extraction from DuckDuckGo HTML endpoints
  *  - Extracts emails from snippets + visited pages
  *  - HR email classification
  *  - Returns stats in the exact structure the frontend expects
- *  - CAPTCHA detection handling (returns 429 with needsCaptcha=true)
+ *  - Basic block / throttle detection (returns 429 with needsCaptcha=true style flag)
  *  - Graceful timeouts + abort controllers
  *  - Unified scrapedUrls objects with hr/general/total counts
+ *
+ * NOTE:
+ *  DuckDuckGo does not supply a classic CAPTCHA page like Bing; "captcha" handling here
+ *  is heuristic (detects certain block patterns or extremely empty SERPs).
  */
 
 const express = require('express');
@@ -27,6 +32,10 @@ const MAX_SINGLE_URLS = 20;
 const MAX_MULTI_PAGES = 10;
 const MAX_MULTI_URLS_PER_PAGE = 20;
 const GLOBAL_TIMEOUT_MS = 15000;
+const PAGE_TEXT_CHAR_LIMIT = 300_000;
+
+const DUCK_BASE_HTML = 'https://duckduckgo.com/html/?q=';
+const DUCK_BASE_LITE = 'https://lite.duckduckgo.com/lite/?q=';
 
 // Regex for emails
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
@@ -62,7 +71,6 @@ function classifyEmails(emails, context = '', hrFocus = true) {
   emails.forEach(email => {
     const lower = email.toLowerCase();
     if (GENERIC_EXCLUDE_PREFIXES.some(p => lower.startsWith(p))) {
-      // Usually generic; only keep as general if hrFocus=false
       if (!hrFocus) general.push(lower);
       return;
     }
@@ -71,7 +79,7 @@ function classifyEmails(emails, context = '', hrFocus = true) {
     const namePattern = /^[a-z]+\.[a-z]+@/i.test(lower);
     const contextHas = HR_EMAIL_KEYWORDS.some(k => ctx.includes(k));
 
-    if (hasKeyword || (contextHas && (namePattern || hrFocus)) || namePattern && hrFocus) {
+    if (hasKeyword || (contextHas && (namePattern || hrFocus)) || (namePattern && hrFocus)) {
       hr.push(lower);
     } else {
       general.push(lower);
@@ -86,22 +94,25 @@ function classifyEmails(emails, context = '', hrFocus = true) {
 }
 
 /**
- * Build an array of Bing queries (deduplicated) depending on hrFocus.
+ * Build an array of DuckDuckGo queries (deduplicated) depending on hrFocus.
+ * (Similar strategy as Bing version but adapted wording as needed.)
  */
-function buildBingQueries(baseQuery, hrFocus, country) {
+function buildDuckQueries(baseQuery, hrFocus, country) {
   const q = baseQuery.trim();
   const geo = country ? country.trim() : 'morocco';
 
   const core = [
-    `"${q}" email contact ${geo}`,
-    `"${q}" ("email us" OR "contact us") ${geo}`
+    `"${q}" email ${geo}`,
+    `"${q}" "contact" ${geo}`,
+    `"${q}" "contact us" ${geo}`
   ];
 
   const hrSet = [
-    `"${q}" ("hr@" OR "careers@" OR "jobs@" OR "recruitment@") ${geo}`,
-    `"${q}" careers jobs apply cv email ${geo}`,
-    `"${q}" ("send your cv" OR "submit your cv" OR "postuler") ${geo}`,
+    `"${q}" ("hr" OR "recruitment" OR "careers" OR "jobs") ${geo} email`,
     `"${q}" recrutement emploi carriere email ${geo}`,
+    `"${q}" "send your cv" ${geo}`,
+    `"${q}" "submit your cv" ${geo}`,
+    `"${q}" "postuler" ${geo} email`,
     `"${q}" site:linkedin.com email ${geo}`,
     `"${q}" site:indeed.com email ${geo}`
   ];
@@ -124,8 +135,10 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = GLOBAL_TIMEOUT_MS) {
       headers: {
         'User-Agent': opts.userAgent ||
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
         ...(opts.headers || {})
       },
       signal: controller.signal
@@ -138,32 +151,107 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = GLOBAL_TIMEOUT_MS) {
   }
 }
 
-async function resolveBingRedirect(url) {
+/**
+ * DuckDuckGo sometimes rewrites external links through /l/?kh=1&uddg=<encodedURL>
+ * This resolves that indirection.
+ */
+function resolveDuckRedirect(rawUrl) {
   try {
-    if (!url.includes('bing.com/ck/a?')) return url;
-    const match = url.match(/u=([^&]+)/);
-    if (!match) return url;
-    let decoded = decodeURIComponent(match[1]);
-    if (decoded.startsWith('a1') && !decoded.startsWith('http')) {
-      try {
-        decoded = Buffer.from(decoded.slice(2), 'base64').toString('utf-8');
-      } catch {
-        return url;
+    const url = new URL(rawUrl);
+    if (url.hostname.includes('duckduckgo.com') && url.pathname.startsWith('/l/')) {
+      const uddg = url.searchParams.get('uddg');
+      if (uddg) {
+        const decoded = decodeURIComponent(uddg);
+        if (/^https?:\/\//i.test(decoded)) return decoded;
       }
     }
-    return decoded.startsWith('http') ? decoded : url;
+    return rawUrl;
   } catch {
-    return url;
+    return rawUrl;
   }
+}
+
+/**
+ * Clean page HTML and return trimmed body text (for email extraction).
+ */
+function cleanAndExtractBody(html) {
+  const $ = cheerio.load(html);
+  $('script,style,noscript,iframe,svg,canvas,meta,link,header,footer,nav,aside,form').remove();
+  let text = $('body').text() || '';
+  text = text.replace(/\r/g, ' ')
+    .replace(/\t/g, ' ')
+    .replace(/[ \u00A0]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .slice(0, PAGE_TEXT_CHAR_LIMIT);
+  return text;
+}
+
+/**
+ * Extract DuckDuckGo result links from both HTML and LITE versions.
+ * We attempt HTML endpoint first; if insufficient, try lite.
+ */
+async function getDuckLinksForQuery(qStr, maxUrlsPerQuery) {
+  const links = new Set();
+
+  // 1. Standard HTML endpoint
+  try {
+    const res = await fetchWithTimeout(DUCK_BASE_HTML + encodeURIComponent(qStr));
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    $('a.result__a').each((_, a) => {
+      const href = $(a).attr('href');
+      if (href && /^https?:\/\//i.test(href)) links.add(href);
+    });
+    // Also decode redirect style links
+    $('a[href*="/l/?"]').each((_, a) => {
+      const href = $(a).attr('href');
+      if (href) {
+        const resolved = resolveDuckRedirect(href);
+        if (/^https?:\/\//i.test(resolved)) links.add(resolved);
+      }
+    });
+  } catch {
+    // ignore, will attempt lite
+  }
+
+  // 2. Lite endpoint if we still need more
+  if (links.size < maxUrlsPerQuery) {
+    try {
+      const resLite = await fetchWithTimeout(DUCK_BASE_LITE + encodeURIComponent(qStr));
+      const liteHtml = await resLite.text();
+      const $lite = cheerio.load(liteHtml);
+      $lite('a').each((_, a) => {
+        const href = $lite(a).attr('href');
+        if (!href) return;
+        if (/^https?:\/\//i.test(href)) {
+          links.add(href);
+        } else if (href.startsWith('/l/?')) {
+            const resolved = resolveDuckRedirect('https://duckduckgo.com' + href);
+            if (/^https?:\/\//i.test(resolved)) links.add(resolved);
+        }
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  // Filter internal DDG / duplicates / tracking
+  const cleaned = [...links].filter(u =>
+    !u.includes('duckduckgo.com') &&
+    !u.includes('lite.duckduckgo.com') &&
+    /^https?:\/\//i.test(u)
+  );
+
+  return cleaned.slice(0, maxUrlsPerQuery * 2); // oversample then slice later
 }
 
 // -------------- CORE SCRAPING LOGIC (shared) -------------- //
 
 /**
- * Executes multiple Bing queries, collects snippet emails and visits top result URLs.
+ * Executes multiple DuckDuckGo queries, collects snippet emails and visits top result URLs.
  * Returns a unified structure for both endpoints.
  */
-async function runBingEmailHunt({
+async function runDuckEmailHunt({
   query,
   hrFocus,
   country,
@@ -171,9 +259,8 @@ async function runBingEmailHunt({
   maxUrlsPerQuery,
   globalUrlBudget
 }) {
-  const queries = buildBingQueries(query, hrFocus, country).slice(0, maxQueries);
+  const queries = buildDuckQueries(query, hrFocus, country).slice(0, maxQueries);
 
-  // Aggregation buckets
   const snippetHREmails = new Set();
   const snippetGeneralEmails = new Set();
   const pageHREmails = new Set();
@@ -183,22 +270,20 @@ async function runBingEmailHunt({
   const failedUrls = [];
   const allSearchUrls = [];
   let totalVisited = 0;
-  let captchaTriggered = false;
+  let blockedDetected = false;
 
   for (let qi = 0; qi < queries.length; qi++) {
     if (globalUrlBudget !== undefined && totalVisited >= globalUrlBudget) break;
 
     const qStr = queries[qi];
-    if (qi > 0) await sleep(1200 + Math.random() * 800);
-    const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(qStr)}&count=15`;
+    if (qi > 0) await sleep(800 + Math.random() * 600);
 
-    let html;
+    let queryLinks = [];
     try {
-      const resp = await fetchWithTimeout(bingUrl);
-      html = await resp.text();
+      queryLinks = await getDuckLinksForQuery(qStr, maxUrlsPerQuery);
     } catch (err) {
       failedUrls.push({
-        url: bingUrl,
+        url: 'duckduckgo:?q=' + qStr,
         error: `Search fetch failed: ${err.name === 'AbortError' ? 'timeout' : err.message}`,
         searchPage: qi + 1,
         type: 'search'
@@ -206,69 +291,64 @@ async function runBingEmailHunt({
       continue;
     }
 
-    if (html.toLowerCase().includes('captcha') && html.includes('b_captcha')) {
-      captchaTriggered = true;
-      // Extract whatever snippet emails exist then stop further queries
-      const snippetEmails = extractEmails(html);
-      const classified = classifyEmails(snippetEmails, html, hrFocus);
-      classified.hr.forEach(e => snippetHREmails.add(e));
-      classified.general.forEach(e => snippetGeneralEmails.add(e));
-      break;
+    // Heuristic block detection: zero links for a reasonably common query
+    if (queryLinks.length === 0) {
+      blockedDetected = true;
     }
 
-    const $ = cheerio.load(html);
-    // Emails in snippets
-    const snippetEmails = extractEmails($('body').text());
-    if (snippetEmails.length) {
-      const classified = classifyEmails(snippetEmails, html, hrFocus);
-      classified.hr.forEach(e => snippetHREmails.add(e));
-      classified.general.forEach(e => snippetGeneralEmails.add(e));
+    // Attempt snippet email extraction using simplified SERP text (lite or html)
+    // We'll refetch HTML endpoint for snippet text (cost: 1 extra request only if needed)
+    try {
+      const respSnippet = await fetchWithTimeout(DUCK_BASE_HTML + encodeURIComponent(qStr));
+      const html = await respSnippet.text();
+      const snippetText = cleanAndExtractBody(html);
+      const snippetEmails = extractEmails(snippetText);
+      if (snippetEmails.length) {
+        const classified = classifyEmails(snippetEmails, snippetText, hrFocus);
+        classified.hr.forEach(e => snippetHREmails.add(e));
+        classified.general.forEach(e => snippetGeneralEmails.add(e));
+      }
+    } catch {
+      // silent
     }
 
-    // Collect result links
-    const links = [];
-    $('li.b_algo h2 a, .b_algo h2 a').each((_, el) => {
-      const href = $(el).attr('href');
-      if (href && href.startsWith('http')) links.push(href);
-    });
-
-    for (const rawLink of links.slice(0, maxUrlsPerQuery)) {
+    // Visit result pages
+    for (const rawLink of queryLinks.slice(0, maxUrlsPerQuery)) {
       if (globalUrlBudget !== undefined && totalVisited >= globalUrlBudget) break;
 
-      let finalUrl = await resolveBingRedirect(rawLink);
+      const finalUrl = resolveDuckRedirect(rawLink);
       allSearchUrls.push(finalUrl);
 
       try {
         totalVisited++;
         const pageResp = await fetchWithTimeout(finalUrl);
         if (!pageResp.ok) throw new Error(`HTTP ${pageResp.status}`);
-        const pageHtml = await pageResp.text();
-        const $$ = cheerio.load(pageHtml);
-        $$('script,style,noscript').remove();
-        const bodyText = $$('body').text();
-        const title = $$('title').text().trim();
-        const pageEmails = extractEmails(bodyText);
 
-        const classified = classifyEmails(pageEmails, bodyText + ' ' + title, hrFocus);
+        const pageHtml = await pageResp.text();
+        const cleanedText = cleanAndExtractBody(pageHtml);
+        const pageEmails = extractEmails(cleanedText);
+
+        const classified = classifyEmails(pageEmails, cleanedText, hrFocus);
         classified.hr.forEach(e => pageHREmails.add(e));
         classified.general.forEach(e => pageGeneralEmails.add(e));
 
         // mailto:
+        const $$ = cheerio.load(pageHtml);
         $$('a[href^="mailto:"]').each((_, a) => {
           const m = $$(a).attr('href');
           if (!m) return;
           const mail = m.replace(/^mailto:/i, '').split('?')[0].trim().toLowerCase();
-            if (mail && EMAIL_REGEX.test(mail)) {
-              const c = classifyEmails([mail], title, hrFocus);
-              c.hr.forEach(e => pageHREmails.add(e));
-              c.general.forEach(e => pageGeneralEmails.add(e));
-            }
+          if (mail && EMAIL_REGEX.test(mail)) {
+            const c = classifyEmails([mail], '', hrFocus);
+            c.hr.forEach(e => pageHREmails.add(e));
+            c.general.forEach(e => pageGeneralEmails.add(e));
+          }
         });
 
         scrapedUrls.push({
           url: finalUrl,
-            searchPage: qi + 1,
-          isHRPage: isLikelyHRPage(finalUrl, title),
+          searchPage: qi + 1,
+          isHRPage: isLikelyHRPage(finalUrl, ''),
           emailCount: {
             hr: classified.hr.length,
             general: classified.general.length,
@@ -292,11 +372,13 @@ async function runBingEmailHunt({
   }
 
   const hrEmails = [...new Set([...snippetHREmails, ...pageHREmails])];
-  const generalEmails = [...new Set([...snippetGeneralEmails, ...pageGeneralEmails]
-    .filter(e => !hrEmails.includes(e)))];
+  const generalEmails = [...new Set(
+    [...snippetGeneralEmails, ...pageGeneralEmails].filter(e => !hrEmails.includes(e))
+  )];
 
   return {
-    captchaTriggered,
+    captchaTriggered: false, // DuckDuckGo rarely uses explicit captcha; using blockedDetected indicator
+    blockedDetected,
     hrEmails,
     generalEmails,
     scrapedUrls,
@@ -330,41 +412,41 @@ router.get('/search', async (req, res) => {
     });
   }
 
-  const urlCount = Math.min(Math.max(parseInt(urls), 1), MAX_SINGLE_URLS);
-  const pageNum = Math.max(parseInt(page), 1);
-  const pageSize = Math.min(Math.max(parseInt(limit), 1), 50);
+  const urlCount = Math.min(Math.max(parseInt(urls, 10), 1), MAX_SINGLE_URLS);
+  const pageNum = Math.max(parseInt(page, 10), 1);
+  const pageSize = Math.min(Math.max(parseInt(limit, 10), 1), 50);
   const focus = hrFocus === 'true';
 
   const start = Date.now();
 
   try {
-    const result = await runBingEmailHunt({
+    const result = await runDuckEmailHunt({
       query,
       hrFocus: focus,
       country,
       maxQueries: 3,
       maxUrlsPerQuery: urlCount,
-      globalUrlBudget: urlCount // total visited across queries
+      globalUrlBudget: urlCount
     });
 
-    if (result.captchaTriggered) {
+    // Treat blockedDetected similar to captcha for UX
+    if (result.blockedDetected && result.hrEmails.length === 0 && result.generalEmails.length === 0) {
       return res.status(429).json({
-        error: 'Captcha detected',
-        needsCaptcha: true,
-        captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`,
+        error: 'Search blocked or yielded no accessible results',
+        needsCaptcha: false,
+        blocked: true,
+        hint: 'DuckDuckGo returned zero links; try different query wording or reduce frequency.'
       });
     }
 
-    // Merge HR + general (HR first if focus)
-    const ordered = focus ? [...result.hrEmails, ...result.generalEmails]
-                          : [...result.hrEmails, ...result.generalEmails].sort();
+    const ordered = focus
+      ? [...result.hrEmails, ...result.generalEmails]
+      : [...result.hrEmails, ...result.generalEmails].sort();
 
-    // Pagination
     const totalEmails = ordered.length;
     const totalPages = Math.max(1, Math.ceil(totalEmails / pageSize));
     const startIdx = (pageNum - 1) * pageSize;
     const paginated = ordered.slice(startIdx, startIdx + pageSize);
-
     const duration = ((Date.now() - start) / 1000).toFixed(2);
 
     res.json({
@@ -425,15 +507,15 @@ router.get('/search-all', async (req, res) => {
     });
   }
 
-  const pages = Math.min(Math.max(parseInt(maxPages), 1), MAX_MULTI_PAGES);
-  const urlsEach = Math.min(Math.max(parseInt(urlsPerPage), 1), MAX_MULTI_URLS_PER_PAGE);
-  const totalUrlLimit = Math.min(Math.max(parseInt(maxUrls), 1), 100);
+  const pages = Math.min(Math.max(parseInt(maxPages, 10), 1), MAX_MULTI_PAGES);
+  const urlsEach = Math.min(Math.max(parseInt(urlsPerPage, 10), 1), MAX_MULTI_URLS_PER_PAGE);
+  const totalUrlLimit = Math.min(Math.max(parseInt(maxUrls, 10), 1), 100);
   const focus = hrFocus === 'true';
 
   const start = Date.now();
 
   try {
-    const result = await runBingEmailHunt({
+    const result = await runDuckEmailHunt({
       query,
       hrFocus: focus,
       country,
@@ -442,21 +524,21 @@ router.get('/search-all', async (req, res) => {
       globalUrlBudget: totalUrlLimit
     });
 
-    if (result.captchaTriggered) {
+    if (result.blockedDetected && result.hrEmails.length === 0 && result.generalEmails.length === 0) {
       return res.status(429).json({
-        error: 'Captcha detected',
-        needsCaptcha: true,
-        captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+        error: 'Search blocked or yielded no accessible results',
+        blocked: true,
+        hint: 'DuckDuckGo returned zero links for all constructed queries.'
       });
     }
 
-    const ordered = focus ? [...result.hrEmails, ...result.generalEmails]
-                          : [...result.hrEmails, ...result.generalEmails].sort();
+    const ordered = focus
+      ? [...result.hrEmails, ...result.generalEmails]
+      : [...result.hrEmails, ...result.generalEmails].sort();
 
-    const totalRawEmails = result.hrEmails.length + result.generalEmails.length; // after classification (already deduped within buckets)
+    const totalRawEmails = result.hrEmails.length + result.generalEmails.length;
     const duration = ((Date.now() - start) / 1000).toFixed(2);
 
-    // Build emailsBySearchPage breakdown
     const pageBreakdown = {};
     result.scrapedUrls.forEach(r => {
       const sp = r.searchPage || 1;
@@ -509,9 +591,10 @@ router.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
+    engine: 'duckduckgo',
     endpoints: {
       '/search': {
-        description: 'Single-page (paginated) Bing email scraping',
+        description: 'Single-page (paginated) DuckDuckGo email scraping',
         params: {
           query: 'string (required)',
           urls: 'int (1-20) max URLs to visit (default 5)',
@@ -522,10 +605,10 @@ router.get('/health', (req, res) => {
         }
       },
       '/search-all': {
-        description: 'Multi-page comprehensive Bing email scraping',
+        description: 'Multi-page comprehensive DuckDuckGo email scraping',
         params: {
           query: 'string (required)',
-          maxPages: 'int (1-10) number of Bing queries (default 3)',
+          maxPages: 'int (1-10) number of constructed queries (default 3)',
           urlsPerPage: 'int (1-20) max URLs visited per query (default 5)',
           maxUrls: 'int (1-100) global URL cap (default 50)',
           country: 'string (default morocco)',
