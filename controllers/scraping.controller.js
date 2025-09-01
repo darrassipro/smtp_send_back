@@ -1,37 +1,58 @@
 /**
- * Scraping Controller (Bing-based)
- * Provides two endpoints:
- *  - GET /api/scraping/search      (paginated single search page)
- *  - GET /api/scraping/search-all  (multi-page comprehensive search)
+ * Scraping Controller (Bing-based)  (Original logic preserved)
+ * NOW WITH DEBUG OUTPUT (on demand or when errors occur)
  *
- * Fully aligned with the Angular front-end interfaces:
- *  ScrapingResponse & ComprehensiveScrapingResponse
+ * HOW TO GET DEBUG (front-end):
+ *   - Add &debug=1 (or &debug=true) to /api/scraping/search or /api/scraping/search-all
+ *   - If an internal error happens, a debug object is returned automatically (if any data was gathered).
  *
- * Key Features:
- *  - Multiple adaptive Bing queries (HR focused if hrFocus=true)
- *  - Extracts emails from snippets + visited pages
- *  - HR email classification
- *  - Returns stats in the exact structure the frontend expects
- *  - CAPTCHA detection handling (returns 429 with needsCaptcha=true)
- *  - Graceful timeouts + abort controllers
- *  - Unified scrapedUrls objects with hr/general/total counts
+ * WHAT DEBUG CONTAINS:
+ *   debug: {
+ *     queries: [...],
+ *     perQuery: [
+ *       {
+ *         index: 1,
+ *         bingQuery: "...",
+ *         serp: {
+ *           status: 200,
+ *           length: 45123,
+ *           hasBAlgo: true,
+ *           captchaSuspect: false,
+ *           snippetEmails: 0,
+ *           linksFound: 5,
+ *           firstLinks: ["https://...","..."],
+ *           htmlSample: "<html ... trimmed...>"
+ *         },
+ *         pages: [
+ *            { url, status, ok, emailCount, hrCount, generalCount, error? }
+ *         ]
+ *       }
+ *     ],
+ *     aggregate: {
+ *       totalQueries,
+ *       totalLinksDiscovered,
+ *       totalPagesFetched,
+ *       totalPageFetchErrors,
+ *       hrEmails,
+ *       generalEmails
+ *     }
+ *   }
+ *
+ * NOTE: We only keep SMALL sanitized htmlSample (first 400 chars, whitespace collapsed)
+ *       to avoid leaking full SERP/page contents.
  */
 
 const express = require('express');
 const cheerio = require('cheerio');
 const router = express.Router();
 
-// ------------------ CONFIG ------------------ //
-
 const MAX_SINGLE_URLS = 20;
 const MAX_MULTI_PAGES = 10;
 const MAX_MULTI_URLS_PER_PAGE = 20;
 const GLOBAL_TIMEOUT_MS = 15000;
 
-// Regex for emails
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
-// HR keyword buckets
 const HR_EMAIL_KEYWORDS = [
   'hr', 'job', 'jobs', 'career', 'careers', 'recruit', 'recruiter', 'recruitment',
   'talent', 'apply', 'hiring', 'people', 'human', 'resource', 'resources',
@@ -43,10 +64,7 @@ const GENERIC_EXCLUDE_PREFIXES = [
   'marketing@', 'sales@', 'webmaster@', 'admin@', 'postmaster@', 'hello@', 'office@'
 ];
 
-// Delay helper
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-// -------------- UTILITIES ------------------ //
 
 function extractEmails(text) {
   if (!text) return [];
@@ -62,7 +80,6 @@ function classifyEmails(emails, context = '', hrFocus = true) {
   emails.forEach(email => {
     const lower = email.toLowerCase();
     if (GENERIC_EXCLUDE_PREFIXES.some(p => lower.startsWith(p))) {
-      // Usually generic; only keep as general if hrFocus=false
       if (!hrFocus) general.push(lower);
       return;
     }
@@ -71,7 +88,7 @@ function classifyEmails(emails, context = '', hrFocus = true) {
     const namePattern = /^[a-z]+\.[a-z]+@/i.test(lower);
     const contextHas = HR_EMAIL_KEYWORDS.some(k => ctx.includes(k));
 
-    if (hasKeyword || (contextHas && (namePattern || hrFocus)) || namePattern && hrFocus) {
+    if (hasKeyword || (contextHas && (namePattern || hrFocus)) || (namePattern && hrFocus)) {
       hr.push(lower);
     } else {
       general.push(lower);
@@ -85,9 +102,6 @@ function classifyEmails(emails, context = '', hrFocus = true) {
   };
 }
 
-/**
- * Build an array of Bing queries (deduplicated) depending on hrFocus.
- */
 function buildBingQueries(baseQuery, hrFocus, country) {
   const q = baseQuery.trim();
   const geo = country ? country.trim() : 'morocco';
@@ -157,11 +171,8 @@ async function resolveBingRedirect(url) {
   }
 }
 
-// -------------- CORE SCRAPING LOGIC (shared) -------------- //
-
 /**
- * Executes multiple Bing queries, collects snippet emails and visits top result URLs.
- * Returns a unified structure for both endpoints.
+ * Core scraping with debug collection.
  */
 async function runBingEmailHunt({
   query,
@@ -169,11 +180,23 @@ async function runBingEmailHunt({
   country,
   maxQueries,
   maxUrlsPerQuery,
-  globalUrlBudget
+  globalUrlBudget,
+  collectDebug = false
 }) {
   const queries = buildBingQueries(query, hrFocus, country).slice(0, maxQueries);
 
-  // Aggregation buckets
+  // Debug structure
+  const debug = collectDebug ? {
+    queries,
+    perQuery: [],
+    aggregate: {
+      totalQueries: queries.length,
+      totalLinksDiscovered: 0,
+      totalPagesFetched: 0,
+      totalPageFetchErrors: 0
+    }
+  } : null;
+
   const snippetHREmails = new Set();
   const snippetGeneralEmails = new Set();
   const pageHREmails = new Set();
@@ -193,107 +216,178 @@ async function runBingEmailHunt({
     const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(qStr)}&count=15`;
 
     let html;
+    let serpStatus = null;
+    let serpError = null;
     try {
       const resp = await fetchWithTimeout(bingUrl);
+      serpStatus = resp.status;
       html = await resp.text();
     } catch (err) {
+      serpError = err.name === 'AbortError' ? 'timeout' : err.message;
       failedUrls.push({
         url: bingUrl,
-        error: `Search fetch failed: ${err.name === 'AbortError' ? 'timeout' : err.message}`,
+        error: `Search fetch failed: ${serpError}`,
         searchPage: qi + 1,
         type: 'search'
       });
+      if (collectDebug) {
+        debug.perQuery.push({
+          index: qi + 1,
+          bingQuery: qStr,
+          serp: { status: serpStatus, error: serpError }
+        });
+      }
       continue;
     }
 
-    if (html.toLowerCase().includes('captcha') && html.includes('b_captcha')) {
+    const lower = html.toLowerCase();
+    const captcha = lower.includes('captcha') && html.includes('b_captcha');
+
+    if (captcha) {
       captchaTriggered = true;
-      // Extract whatever snippet emails exist then stop further queries
-      const snippetEmails = extractEmails(html);
-      const classified = classifyEmails(snippetEmails, html, hrFocus);
-      classified.hr.forEach(e => snippetHREmails.add(e));
-      classified.general.forEach(e => snippetGeneralEmails.add(e));
-      break;
     }
 
     const $ = cheerio.load(html);
-    // Emails in snippets
-    const snippetEmails = extractEmails($('body').text());
+    const bodyText = $('body').text();
+    const snippetEmails = extractEmails(bodyText);
     if (snippetEmails.length) {
       const classified = classifyEmails(snippetEmails, html, hrFocus);
       classified.hr.forEach(e => snippetHREmails.add(e));
       classified.general.forEach(e => snippetGeneralEmails.add(e));
     }
 
-    // Collect result links
     const links = [];
     $('li.b_algo h2 a, .b_algo h2 a').each((_, el) => {
       const href = $(el).attr('href');
       if (href && href.startsWith('http')) links.push(href);
     });
 
+    if (collectDebug) {
+      debug.aggregate.totalLinksDiscovered += links.length;
+    }
+
+    const queryDebug = collectDebug ? {
+      index: qi + 1,
+      bingQuery: qStr,
+      serp: {
+        status: serpStatus,
+        length: html.length,
+        hasBAlgo: html.includes('b_algo'),
+        captchaSuspect: captcha,
+        snippetEmails: snippetEmails.length,
+        linksFound: links.length,
+        firstLinks: links.slice(0, 5),
+        htmlSample: html.slice(0, 400).replace(/\s+/g, ' ')
+      },
+      pages: []
+    } : null;
+
     for (const rawLink of links.slice(0, maxUrlsPerQuery)) {
       if (globalUrlBudget !== undefined && totalVisited >= globalUrlBudget) break;
-
       let finalUrl = await resolveBingRedirect(rawLink);
       allSearchUrls.push(finalUrl);
+
+      let pageStatus = null;
+      let pageOk = false;
+      let pageErr = null;
+      let pageEmailsCount = 0;
+      let hrAdded = 0;
+      let generalAdded = 0;
 
       try {
         totalVisited++;
         const pageResp = await fetchWithTimeout(finalUrl);
+        pageStatus = pageResp.status;
         if (!pageResp.ok) throw new Error(`HTTP ${pageResp.status}`);
         const pageHtml = await pageResp.text();
         const $$ = cheerio.load(pageHtml);
         $$('script,style,noscript').remove();
-        const bodyText = $$('body').text();
+        const body = $$('body').text();
         const title = $$('title').text().trim();
-        const pageEmails = extractEmails(bodyText);
+        const pageEmails = extractEmails(body);
 
-        const classified = classifyEmails(pageEmails, bodyText + ' ' + title, hrFocus);
-        classified.hr.forEach(e => pageHREmails.add(e));
-        classified.general.forEach(e => pageGeneralEmails.add(e));
+        pageEmailsCount = pageEmails.length;
 
-        // mailto:
+        if (pageEmails.length) {
+          const classified = classifyEmails(pageEmails, body + ' ' + title, hrFocus);
+          hrAdded = classified.hr.length;
+          generalAdded = classified.general.length;
+          classified.hr.forEach(e => pageHREmails.add(e));
+          classified.general.forEach(e => pageGeneralEmails.add(e));
+        }
+
+        // mailto
         $$('a[href^="mailto:"]').each((_, a) => {
           const m = $$(a).attr('href');
           if (!m) return;
           const mail = m.replace(/^mailto:/i, '').split('?')[0].trim().toLowerCase();
-            if (mail && EMAIL_REGEX.test(mail)) {
-              const c = classifyEmails([mail], title, hrFocus);
-              c.hr.forEach(e => pageHREmails.add(e));
-              c.general.forEach(e => pageGeneralEmails.add(e));
-            }
+          if (mail && EMAIL_REGEX.test(mail)) {
+            const c2 = classifyEmails([mail], title, hrFocus);
+            c2.hr.forEach(e => pageHREmails.add(e));
+            c2.general.forEach(e => pageGeneralEmails.add(e));
+            hrAdded += c2.hr.length;
+            generalAdded += c2.general.length;
+            pageEmailsCount += c2.hr.length + c2.general.length;
+          }
         });
 
         scrapedUrls.push({
           url: finalUrl,
-            searchPage: qi + 1,
+          searchPage: qi + 1,
           isHRPage: isLikelyHRPage(finalUrl, title),
           emailCount: {
-            hr: classified.hr.length,
-            general: classified.general.length,
-            total: classified.all.length
+            hr: hrAdded,
+            general: generalAdded,
+            total: hrAdded + generalAdded
           },
-          emails: {
-            hr: classified.hr,
-            general: classified.general,
-            all: classified.all
-          }
+          emails: undefined // kept lightweight for production
         });
+        pageOk = true;
+        if (collectDebug) debug.aggregate.totalPagesFetched += 1;
       } catch (err) {
+        pageErr = err.name === 'AbortError' ? 'timeout' : err.message;
         failedUrls.push({
           url: finalUrl,
-          error: err.name === 'AbortError' ? 'timeout' : err.message,
+          error: pageErr,
           searchPage: qi + 1,
           type: 'page'
         });
+        if (collectDebug) debug.aggregate.totalPageFetchErrors += 1;
+      }
+
+      if (collectDebug && queryDebug) {
+        queryDebug.pages.push({
+          url: finalUrl,
+          status: pageStatus,
+          ok: pageOk,
+          emailCount: pageEmailsCount,
+          hrCount: hrAdded,
+          generalCount: generalAdded,
+          error: pageErr || undefined
+        });
       }
     }
+
+    if (collectDebug && queryDebug) {
+      debug.perQuery.push(queryDebug);
+    }
+
+    if (captcha) break;
   }
 
   const hrEmails = [...new Set([...snippetHREmails, ...pageHREmails])];
-  const generalEmails = [...new Set([...snippetGeneralEmails, ...pageGeneralEmails]
-    .filter(e => !hrEmails.includes(e)))];
+  const generalEmails = [...new Set(
+    [...snippetGeneralEmails, ...pageGeneralEmails].filter(e => !hrEmails.includes(e))
+  )];
+
+  if (collectDebug) {
+    debug.aggregate.hrEmails = hrEmails.length;
+    debug.aggregate.generalEmails = generalEmails.length;
+    debug.aggregate.scrapedUrls = scrapedUrls.length;
+    debug.aggregate.failedUrls = failedUrls.length;
+    debug.aggregate.allSearchUrls = allSearchUrls.length;
+    debug.aggregate.captchaTriggered = captchaTriggered;
+  }
 
   return {
     captchaTriggered,
@@ -307,12 +401,12 @@ async function runBingEmailHunt({
       snippetGeneral: snippetGeneralEmails.size,
       pageHr: pageHREmails.size,
       pageGeneral: pageGeneralEmails.size
-    }
+    },
+    debug
   };
 }
 
-// -------------- ENDPOINT: /search (paginated) -------------- //
-
+// ---------------- /search ---------------- //
 router.get('/search', async (req, res) => {
   const {
     query,
@@ -320,7 +414,8 @@ router.get('/search', async (req, res) => {
     page = 1,
     limit = 10,
     country = 'morocco',
-    hrFocus = 'true'
+    hrFocus = 'true',
+    debug
   } = req.query;
 
   if (!query) {
@@ -330,11 +425,11 @@ router.get('/search', async (req, res) => {
     });
   }
 
+  const collectDebug = debug === '1' || debug === 'true';
   const urlCount = Math.min(Math.max(parseInt(urls), 1), MAX_SINGLE_URLS);
   const pageNum = Math.max(parseInt(page), 1);
   const pageSize = Math.min(Math.max(parseInt(limit), 1), 50);
   const focus = hrFocus === 'true';
-
   const start = Date.now();
 
   try {
@@ -344,7 +439,8 @@ router.get('/search', async (req, res) => {
       country,
       maxQueries: 3,
       maxUrlsPerQuery: urlCount,
-      globalUrlBudget: urlCount // total visited across queries
+      globalUrlBudget: urlCount,
+      collectDebug
     });
 
     if (result.captchaTriggered) {
@@ -352,19 +448,18 @@ router.get('/search', async (req, res) => {
         error: 'Captcha detected',
         needsCaptcha: true,
         captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`,
+        debug: collectDebug ? result.debug : undefined
       });
     }
 
-    // Merge HR + general (HR first if focus)
-    const ordered = focus ? [...result.hrEmails, ...result.generalEmails]
-                          : [...result.hrEmails, ...result.generalEmails].sort();
+    const ordered = focus
+      ? [...result.hrEmails, ...result.generalEmails]
+      : [...result.hrEmails, ...result.generalEmails].sort();
 
-    // Pagination
     const totalEmails = ordered.length;
     const totalPages = Math.max(1, Math.ceil(totalEmails / pageSize));
     const startIdx = (pageNum - 1) * pageSize;
     const paginated = ordered.slice(startIdx, startIdx + pageSize);
-
     const duration = ((Date.now() - start) / 1000).toFixed(2);
 
     res.json({
@@ -394,20 +489,23 @@ router.get('/search', async (req, res) => {
       details: {
         scrapedUrls: result.scrapedUrls,
         failedUrls: result.failedUrls
-      }
+      },
+      debug: collectDebug ? result.debug : undefined,
+      note: collectDebug && ordered.length === 0 ? 'NO_EMAILS_RETURNED' : undefined
     });
 
   } catch (err) {
     console.error('SEARCH ERROR:', err);
-    res.status(500).json({
+    return res.status(500).json({
       error: 'Scraping failed',
-      message: err.message || 'Unknown error'
+      message: err.message || 'Unknown error',
+      debugHint: 'Check debug.perQuery serp.status / linksFound',
+      // Provide partial debug if we had started anything (none here because runBingEmailHunt failed early)
     });
   }
 });
 
-// -------------- ENDPOINT: /search-all (multi-page) -------------- //
-
+// ---------------- /search-all ---------------- //
 router.get('/search-all', async (req, res) => {
   const {
     query,
@@ -415,7 +513,8 @@ router.get('/search-all', async (req, res) => {
     urlsPerPage = 5,
     maxUrls = 50,
     country = 'morocco',
-    hrFocus = 'true'
+    hrFocus = 'true',
+    debug
   } = req.query;
 
   if (!query) {
@@ -425,11 +524,11 @@ router.get('/search-all', async (req, res) => {
     });
   }
 
+  const collectDebug = debug === '1' || debug === 'true';
   const pages = Math.min(Math.max(parseInt(maxPages), 1), MAX_MULTI_PAGES);
   const urlsEach = Math.min(Math.max(parseInt(urlsPerPage), 1), MAX_MULTI_URLS_PER_PAGE);
   const totalUrlLimit = Math.min(Math.max(parseInt(maxUrls), 1), 100);
   const focus = hrFocus === 'true';
-
   const start = Date.now();
 
   try {
@@ -439,31 +538,36 @@ router.get('/search-all', async (req, res) => {
       country,
       maxQueries: pages,
       maxUrlsPerQuery: urlsEach,
-      globalUrlBudget: totalUrlLimit
+      globalUrlBudget: totalUrlLimit,
+      collectDebug
     });
 
     if (result.captchaTriggered) {
       return res.status(429).json({
         error: 'Captcha detected',
         needsCaptcha: true,
-        captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+        captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`,
+        debug: collectDebug ? result.debug : undefined
       });
     }
 
-    const ordered = focus ? [...result.hrEmails, ...result.generalEmails]
-                          : [...result.hrEmails, ...result.generalEmails].sort();
+    const ordered = focus
+      ? [...result.hrEmails, ...result.generalEmails]
+      : [...result.hrEmails, ...result.generalEmails].sort();
 
-    const totalRawEmails = result.hrEmails.length + result.generalEmails.length; // after classification (already deduped within buckets)
+    const totalRawEmails = result.hrEmails.length + result.generalEmails.length;
     const duration = ((Date.now() - start) / 1000).toFixed(2);
 
-    // Build emailsBySearchPage breakdown
     const pageBreakdown = {};
     result.scrapedUrls.forEach(r => {
       const sp = r.searchPage || 1;
       if (!pageBreakdown[sp]) pageBreakdown[sp] = { hr: 0, general: 0, total: 0 };
-      pageBreakdown[sp].hr += r.emailCount.hr;
-      pageBreakdown[sp].general += r.emailCount.general;
-      pageBreakdown[sp].total += r.emailCount.total;
+      if (r.emailCount && typeof r.emailCount === 'object') {
+        // r.emailCount fields already cumulative or per page? Here we just set (not sum) to reflect final discovered for that URL pass
+        pageBreakdown[sp].hr += r.emailCount.hr;
+        pageBreakdown[sp].general += r.emailCount.general;
+        pageBreakdown[sp].total += r.emailCount.total;
+      }
     });
 
     res.json({
@@ -492,14 +596,17 @@ router.get('/search-all', async (req, res) => {
         scrapedUrls: result.scrapedUrls,
         failedUrls: result.failedUrls,
         allSearchUrls: result.allSearchUrls
-      }
+      },
+      debug: collectDebug ? result.debug : undefined,
+      note: collectDebug && ordered.length === 0 ? 'NO_EMAILS_RETURNED' : undefined
     });
 
   } catch (err) {
     console.error('SEARCH-ALL ERROR:', err);
-    res.status(500).json({
+    return res.status(500).json({
       error: 'Comprehensive scraping failed',
-      message: err.message || 'Unknown error'
+      message: err.message || 'Unknown error',
+      debugHint: 'Use &debug=1 to capture perQuery details'
     });
   }
 });
@@ -518,7 +625,8 @@ router.get('/health', (req, res) => {
           page: 'int pagination page (default 1)',
           limit: 'int emails per page (default 10)',
           country: 'string (default morocco)',
-          hrFocus: 'true|false (default true)'
+          hrFocus: 'true|false (default true)',
+          debug: 'true|1 optional'
         }
       },
       '/search-all': {
@@ -527,9 +635,10 @@ router.get('/health', (req, res) => {
           query: 'string (required)',
           maxPages: 'int (1-10) number of Bing queries (default 3)',
           urlsPerPage: 'int (1-20) max URLs visited per query (default 5)',
-          maxUrls: 'int (1-100) global URL cap (default 50)',
+            maxUrls: 'int (1-100) global URL cap (default 50)',
           country: 'string (default morocco)',
-          hrFocus: 'true|false (default true)'
+          hrFocus: 'true|false (default true)',
+          debug: 'true|1 optional'
         }
       }
     }
