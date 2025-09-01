@@ -1,21 +1,20 @@
 /**
- * Scraping Controller (Bing-based) – Robust Selectors + HTML Cleaning + Plain Text Email Extraction
+ * Scraping Controller (Bing-based)
+ * Provides two endpoints:
+ *  - GET /api/scraping/search      (paginated single search page)
+ *  - GET /api/scraping/search-all  (multi-page comprehensive search)
  *
- * Endpoints:
- *  - GET /api/scraping/search
- *  - GET /api/scraping/search-all
+ * Fully aligned with the Angular front-end interfaces:
+ *  ScrapingResponse & ComprehensiveScrapingResponse
  *
- * Features (original contract preserved):
- *  - Adaptive Bing queries (HR focus optional)
- *  - Robust multi-selector link extraction (works better on Vercel)
- *  - Optional JSON "url" pattern extraction if normal selectors fail
- *  - Cleans SERP & page HTML (removes script/style/header/footer/nav/etc.) before email extraction
- *  - Plain text + mailto: email extraction (regex)
- *  - HR email classification (unchanged logic)
- *  - CAPTCHA / soft-block detection (basic)
- *  - Stats + pagination identical to original structure
- *
- * NOTE: Generic emails (info@, contact@ ...) are still excluded when hrFocus=true (original behavior).
+ * Key Features:
+ *  - Multiple adaptive Bing queries (HR focused if hrFocus=true)
+ *  - Extracts emails from snippets + visited pages
+ *  - HR email classification
+ *  - Returns stats in the exact structure the frontend expects
+ *  - CAPTCHA detection handling (returns 429 with needsCaptcha=true)
+ *  - Graceful timeouts + abort controllers
+ *  - Unified scrapedUrls objects with hr/general/total counts
  */
 
 const express = require('express');
@@ -28,9 +27,8 @@ const MAX_SINGLE_URLS = 20;
 const MAX_MULTI_PAGES = 10;
 const MAX_MULTI_URLS_PER_PAGE = 20;
 const GLOBAL_TIMEOUT_MS = 15000;
-const PAGE_CLEAN_CHAR_LIMIT = 250_000;
 
-// Regex for emails (strict)
+// Regex for emails
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
 // HR keyword buckets
@@ -43,17 +41,6 @@ const HR_EMAIL_KEYWORDS = [
 const GENERIC_EXCLUDE_PREFIXES = [
   'info@', 'contact@', 'support@', 'help@', 'noreply@', 'no-reply@', 'newsletter@',
   'marketing@', 'sales@', 'webmaster@', 'admin@', 'postmaster@', 'hello@', 'office@'
-];
-
-// SERP link selectors (robust, ordered – we stop early if we accumulate enough)
-const SERP_LINK_SELECTORS = [
-  'li.b_algo h2 a',
-  '.b_algo h2 a',
-  '#b_results li.b_algo h2 a',
-  '#b_results h2 a',
-  '#b_results a[href^="http"]',
-  'main h2 a[href^="http"]',
-  'main a[href^="http"]'
 ];
 
 // Delay helper
@@ -75,6 +62,7 @@ function classifyEmails(emails, context = '', hrFocus = true) {
   emails.forEach(email => {
     const lower = email.toLowerCase();
     if (GENERIC_EXCLUDE_PREFIXES.some(p => lower.startsWith(p))) {
+      // Usually generic; only keep as general if hrFocus=false
       if (!hrFocus) general.push(lower);
       return;
     }
@@ -83,7 +71,7 @@ function classifyEmails(emails, context = '', hrFocus = true) {
     const namePattern = /^[a-z]+\.[a-z]+@/i.test(lower);
     const contextHas = HR_EMAIL_KEYWORDS.some(k => ctx.includes(k));
 
-    if (hasKeyword || (contextHas && (namePattern || hrFocus)) || (namePattern && hrFocus)) {
+    if (hasKeyword || (contextHas && (namePattern || hrFocus)) || namePattern && hrFocus) {
       hr.push(lower);
     } else {
       general.push(lower);
@@ -135,12 +123,9 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = GLOBAL_TIMEOUT_MS) {
       ...opts,
       headers: {
         'User-Agent': opts.userAgent ||
-          // Rotating pool optional – for simplicity one modern UA
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': opts.accept || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
         ...(opts.headers || {})
       },
       signal: controller.signal
@@ -172,70 +157,12 @@ async function resolveBingRedirect(url) {
   }
 }
 
-/* Clean a Cheerio root: remove noise nodes before extracting text/emails */
-function cleanCheerio($) {
-  const REMOVE = [
-    'script','style','noscript','iframe','svg','canvas','meta','link',
-    'header','footer','nav','aside','form','input','button','select',
-    'textarea','template'
-  ];
-  REMOVE.forEach(sel => $(sel).remove());
-
-  // Remove large nav / megamenus heuristically (lists with many links & little text diversity)
-  $('ul,ol').each((_, el) => {
-    const linkCount = $(el).find('a').length;
-    if (linkCount > 30) $(el).remove();
-  });
-}
-
-/* Extract links from SERP using robust selectors, fallback to JSON pattern if empty */
-function extractSerpLinks(html) {
-  const $ = cheerio.load(html);
-  cleanCheerio($);
-  const linkSet = new Set();
-
-  for (const sel of SERP_LINK_SELECTORS) {
-    $(sel).each((_, el) => {
-      const href = $(el).attr('href');
-      if (!href) return;
-      if (!/^https?:\/\//i.test(href)) return;
-      if (href.includes('bing.com')) return;
-      linkSet.add(href);
-    });
-    if (linkSet.size >= 50) break; // avoid runaway
-  }
-
-  // JSON pattern fallback (some Bing variants embed urls in inline JSON)
-  if (linkSet.size === 0) {
-    const jsonMatches = html.match(/"url":"https?:\\?\/\\?\/[^"]+?"/g) || [];
-    jsonMatches.forEach(m => {
-      let url = m.slice(7, -1).replace(/\\\//g, '/');
-      if (url.startsWith('http') && !url.includes('bing.com')) {
-        linkSet.add(url);
-      }
-    });
-  }
-
-  return [...linkSet];
-}
-
-/* Clean plain page HTML and return body text + emails */
-function extractPageEmails(html, hrFocus) {
-  const $ = cheerio.load(html);
-  cleanCheerio($);
-  let text = $('body').text() || '';
-  // Normalize & trim
-  text = text.replace(/\r/g, ' ')
-             .replace(/\t/g, ' ')
-             .replace(/[ \u00A0]{2,}/g, ' ')
-             .replace(/\n{3,}/g, '\n\n')
-             .slice(0, PAGE_CLEAN_CHAR_LIMIT);
-  const emails = extractEmails(text);
-  return { text, emails };
-}
-
 // -------------- CORE SCRAPING LOGIC (shared) -------------- //
 
+/**
+ * Executes multiple Bing queries, collects snippet emails and visits top result URLs.
+ * Returns a unified structure for both endpoints.
+ */
 async function runBingEmailHunt({
   query,
   hrFocus,
@@ -246,6 +173,7 @@ async function runBingEmailHunt({
 }) {
   const queries = buildBingQueries(query, hrFocus, country).slice(0, maxQueries);
 
+  // Aggregation buckets
   const snippetHREmails = new Set();
   const snippetGeneralEmails = new Set();
   const pageHREmails = new Set();
@@ -261,11 +189,8 @@ async function runBingEmailHunt({
     if (globalUrlBudget !== undefined && totalVisited >= globalUrlBudget) break;
 
     const qStr = queries[qi];
-    if (qi > 0) await sleep(900 + Math.random() * 600);
-
-    const bingUrl =
-      `https://www.bing.com/search?q=${encodeURIComponent(qStr)}` +
-      `&count=15&mkt=en-US&setlang=en-US&cc=US&ensearch=1&safeSearch=Off`;
+    if (qi > 0) await sleep(1200 + Math.random() * 800);
+    const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(qStr)}&count=15`;
 
     let html;
     try {
@@ -281,9 +206,9 @@ async function runBingEmailHunt({
       continue;
     }
 
-    const lower = html.toLowerCase();
-    if (lower.includes('captcha') && html.includes('b_captcha')) {
+    if (html.toLowerCase().includes('captcha') && html.includes('b_captcha')) {
       captchaTriggered = true;
+      // Extract whatever snippet emails exist then stop further queries
       const snippetEmails = extractEmails(html);
       const classified = classifyEmails(snippetEmails, html, hrFocus);
       classified.hr.forEach(e => snippetHREmails.add(e));
@@ -291,24 +216,26 @@ async function runBingEmailHunt({
       break;
     }
 
-    // SERP cleaning & snippet email capture
     const $ = cheerio.load(html);
-    cleanCheerio($);
-    const snippetText = $('body').text();
-    const snippetEmails = extractEmails(snippetText);
+    // Emails in snippets
+    const snippetEmails = extractEmails($('body').text());
     if (snippetEmails.length) {
-      const classified = classifyEmails(snippetEmails, snippetText, hrFocus);
+      const classified = classifyEmails(snippetEmails, html, hrFocus);
       classified.hr.forEach(e => snippetHREmails.add(e));
       classified.general.forEach(e => snippetGeneralEmails.add(e));
     }
 
-    // Robust link extraction
-    const links = extractSerpLinks(html);
+    // Collect result links
+    const links = [];
+    $('li.b_algo h2 a, .b_algo h2 a').each((_, el) => {
+      const href = $(el).attr('href');
+      if (href && href.startsWith('http')) links.push(href);
+    });
 
-    for (const raw of links.slice(0, maxUrlsPerQuery)) {
+    for (const rawLink of links.slice(0, maxUrlsPerQuery)) {
       if (globalUrlBudget !== undefined && totalVisited >= globalUrlBudget) break;
 
-      const finalUrl = await resolveBingRedirect(raw);
+      let finalUrl = await resolveBingRedirect(rawLink);
       allSearchUrls.push(finalUrl);
 
       try {
@@ -316,30 +243,32 @@ async function runBingEmailHunt({
         const pageResp = await fetchWithTimeout(finalUrl);
         if (!pageResp.ok) throw new Error(`HTTP ${pageResp.status}`);
         const pageHtml = await pageResp.text();
+        const $$ = cheerio.load(pageHtml);
+        $$('script,style,noscript').remove();
+        const bodyText = $$('body').text();
+        const title = $$('title').text().trim();
+        const pageEmails = extractEmails(bodyText);
 
-        const { text: cleanedText, emails: pageEmails } = extractPageEmails(pageHtml, hrFocus);
-
-        const classified = classifyEmails(pageEmails, cleanedText, hrFocus);
+        const classified = classifyEmails(pageEmails, bodyText + ' ' + title, hrFocus);
         classified.hr.forEach(e => pageHREmails.add(e));
         classified.general.forEach(e => pageGeneralEmails.add(e));
 
-        // mailto fallback
-        const $$ = cheerio.load(pageHtml);
+        // mailto:
         $$('a[href^="mailto:"]').each((_, a) => {
-          const mailHref = $$(a).attr('href');
-          if (!mailHref) return;
-          const mail = mailHref.replace(/^mailto:/i, '').split('?')[0].trim().toLowerCase();
-          if (mail && EMAIL_REGEX.test(mail)) {
-            const c = classifyEmails([mail], '', hrFocus);
-            c.hr.forEach(e => pageHREmails.add(e));
-            c.general.forEach(e => pageGeneralEmails.add(e));
-          }
+          const m = $$(a).attr('href');
+          if (!m) return;
+          const mail = m.replace(/^mailto:/i, '').split('?')[0].trim().toLowerCase();
+            if (mail && EMAIL_REGEX.test(mail)) {
+              const c = classifyEmails([mail], title, hrFocus);
+              c.hr.forEach(e => pageHREmails.add(e));
+              c.general.forEach(e => pageGeneralEmails.add(e));
+            }
         });
 
         scrapedUrls.push({
           url: finalUrl,
-          searchPage: qi + 1,
-          isHRPage: isLikelyHRPage(finalUrl, ''),
+            searchPage: qi + 1,
+          isHRPage: isLikelyHRPage(finalUrl, title),
           emailCount: {
             hr: classified.hr.length,
             general: classified.general.length,
@@ -363,9 +292,8 @@ async function runBingEmailHunt({
   }
 
   const hrEmails = [...new Set([...snippetHREmails, ...pageHREmails])];
-  const generalEmails = [...new Set(
-    [...snippetGeneralEmails, ...pageGeneralEmails].filter(e => !hrEmails.includes(e))
-  )];
+  const generalEmails = [...new Set([...snippetGeneralEmails, ...pageGeneralEmails]
+    .filter(e => !hrEmails.includes(e)))];
 
   return {
     captchaTriggered,
@@ -402,9 +330,9 @@ router.get('/search', async (req, res) => {
     });
   }
 
-  const urlCount = Math.min(Math.max(parseInt(urls, 10), 1), MAX_SINGLE_URLS);
-  const pageNum = Math.max(parseInt(page, 10), 1);
-  const pageSize = Math.min(Math.max(parseInt(limit, 10), 1), 50);
+  const urlCount = Math.min(Math.max(parseInt(urls), 1), MAX_SINGLE_URLS);
+  const pageNum = Math.max(parseInt(page), 1);
+  const pageSize = Math.min(Math.max(parseInt(limit), 1), 50);
   const focus = hrFocus === 'true';
 
   const start = Date.now();
@@ -416,21 +344,22 @@ router.get('/search', async (req, res) => {
       country,
       maxQueries: 3,
       maxUrlsPerQuery: urlCount,
-      globalUrlBudget: urlCount
+      globalUrlBudget: urlCount // total visited across queries
     });
 
     if (result.captchaTriggered) {
       return res.status(429).json({
         error: 'Captcha detected',
         needsCaptcha: true,
-        captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`
+        captchaUrl: `https://www.bing.com/search?q=${encodeURIComponent(query)}`,
       });
     }
 
-    const ordered = focus
-      ? [...result.hrEmails, ...result.generalEmails]
-      : [...result.hrEmails, ...result.generalEmails].sort();
+    // Merge HR + general (HR first if focus)
+    const ordered = focus ? [...result.hrEmails, ...result.generalEmails]
+                          : [...result.hrEmails, ...result.generalEmails].sort();
 
+    // Pagination
     const totalEmails = ordered.length;
     const totalPages = Math.max(1, Math.ceil(totalEmails / pageSize));
     const startIdx = (pageNum - 1) * pageSize;
@@ -496,9 +425,9 @@ router.get('/search-all', async (req, res) => {
     });
   }
 
-  const pages = Math.min(Math.max(parseInt(maxPages, 10), 1), MAX_MULTI_PAGES);
-  const urlsEach = Math.min(Math.max(parseInt(urlsPerPage, 10), 1), MAX_MULTI_URLS_PER_PAGE);
-  const totalUrlLimit = Math.min(Math.max(parseInt(maxUrls, 10), 1), 100);
+  const pages = Math.min(Math.max(parseInt(maxPages), 1), MAX_MULTI_PAGES);
+  const urlsEach = Math.min(Math.max(parseInt(urlsPerPage), 1), MAX_MULTI_URLS_PER_PAGE);
+  const totalUrlLimit = Math.min(Math.max(parseInt(maxUrls), 1), 100);
   const focus = hrFocus === 'true';
 
   const start = Date.now();
@@ -521,13 +450,13 @@ router.get('/search-all', async (req, res) => {
       });
     }
 
-    const ordered = focus
-      ? [...result.hrEmails, ...result.generalEmails]
-      : [...result.hrEmails, ...result.generalEmails].sort();
+    const ordered = focus ? [...result.hrEmails, ...result.generalEmails]
+                          : [...result.hrEmails, ...result.generalEmails].sort();
 
-    const totalRawEmails = result.hrEmails.length + result.generalEmails.length;
+    const totalRawEmails = result.hrEmails.length + result.generalEmails.length; // after classification (already deduped within buckets)
     const duration = ((Date.now() - start) / 1000).toFixed(2);
 
+    // Build emailsBySearchPage breakdown
     const pageBreakdown = {};
     result.scrapedUrls.forEach(r => {
       const sp = r.searchPage || 1;
@@ -585,9 +514,9 @@ router.get('/health', (req, res) => {
         description: 'Single-page (paginated) Bing email scraping',
         params: {
           query: 'string (required)',
-          urls: 'int (1-20)',
-          page: 'int',
-          limit: 'int',
+          urls: 'int (1-20) max URLs to visit (default 5)',
+          page: 'int pagination page (default 1)',
+          limit: 'int emails per page (default 10)',
           country: 'string (default morocco)',
           hrFocus: 'true|false (default true)'
         }
@@ -596,9 +525,9 @@ router.get('/health', (req, res) => {
         description: 'Multi-page comprehensive Bing email scraping',
         params: {
           query: 'string (required)',
-          maxPages: 'int (1-10)',
-          urlsPerPage: 'int (1-20)',
-          maxUrls: 'int (1-100)',
+          maxPages: 'int (1-10) number of Bing queries (default 3)',
+          urlsPerPage: 'int (1-20) max URLs visited per query (default 5)',
+          maxUrls: 'int (1-100) global URL cap (default 50)',
           country: 'string (default morocco)',
           hrFocus: 'true|false (default true)'
         }
@@ -606,5 +535,6 @@ router.get('/health', (req, res) => {
     }
   });
 });
+
 
 module.exports = router;
