@@ -1,6 +1,11 @@
 /**
- * Scraping Controller (Bing-based) - with fallback + broader selectors + debug
- * (Keeps your original logic & classification; only adds resiliency.)
+ * Scraping Controller (Bing-based) with:
+ *  - Bing + JSON URL extraction + DuckDuckGo fallback (from previous version)
+ *  - Enhanced page cleaning & plain-text email extraction
+ *  - Obfuscated email pattern handling ( [at], (at), at , [dot], dot, etc.)
+ *  - Debug info for cleaned extraction
+ *
+ * NOTE: Classification logic unchanged (generic emails skipped if hrFocus=true).
  */
 
 const express = require('express');
@@ -12,12 +17,27 @@ const MAX_MULTI_PAGES = 10;
 const MAX_MULTI_URLS_PER_PAGE = 20;
 const GLOBAL_TIMEOUT_MS = 15000;
 
-const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+// Limits & controls
+const PAGE_TEXT_CHAR_LIMIT = 300_000;   // Hard cap of cleaned text scanned
+const MAX_OBFUSCATION_SAMPLE = 5;
+
+// Regexes
+const EMAIL_REGEX_STRICT = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+// Loose tokens for obfuscated emails (replace after normalization)
+const OBFUSCATION_AT = /\b(?:\[at\]|\(at\)|\sat\s|\s@\s|{at}| at )\b/gi;
+const OBFUSCATION_DOT = /\b(?:\[dot\]|\(dot\)|\sdot\s| dot )\b/gi;
+
+// Secondary capture: sequences like word (at) domain (dot) tld
+// We'll normalize text then run strict EMAIL_REGEX_STRICT again.
+const HTML_ENTITY_REGEX = /&(#\d+|[a-zA-Z]+);/g;
+
+// HR keywords & generic prefixes
 const HR_EMAIL_KEYWORDS = [
   'hr','job','jobs','career','careers','recruit','recruiter','recruitment',
   'talent','apply','hiring','people','human','resource','resources',
   'employment','candidature','recrutement','carriere','emploi','poste','cv'
 ];
+
 const GENERIC_EXCLUDE_PREFIXES = [
   'info@','contact@','support@','help@','noreply@','no-reply@','newsletter@',
   'marketing@','sales@','webmaster@','admin@','postmaster@','hello@','office@'
@@ -25,10 +45,66 @@ const GENERIC_EXCLUDE_PREFIXES = [
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function extractEmails(text) {
+function decodeEntities(str = '') {
+  return str.replace(HTML_ENTITY_REGEX, (m, ent) => {
+    if (ent.startsWith('#')) {
+      const code = parseInt(ent.slice(1), 10);
+      return isNaN(code) ? m : String.fromCharCode(code);
+    }
+    switch (ent.toLowerCase()) {
+      case 'amp': return '&';
+      case 'lt': return '<';
+      case 'gt': return '>';
+      case 'quot': return '"';
+      case 'apos': return "'";
+      default: return m;
+    }
+  });
+}
+
+function extractEmailsStrict(text) {
   if (!text) return [];
-  const raw = text.match(EMAIL_REGEX) || [];
-  return [...new Set(raw.map(e => e.trim().toLowerCase()))];
+  const matches = text.match(EMAIL_REGEX_STRICT) || [];
+  return [...new Set(matches.map(e => e.toLowerCase()))];
+}
+
+function normalizeForObfuscation(raw) {
+  if (!raw) return '';
+  let t = decodeEntities(raw);
+  // Remove excessive punctuation separating tokens in emails.
+  t = t.replace(/[\u00A0]/g, ' ');
+  // Standardize brackets & parentheses spacing
+  t = t.replace(/[\[\]\(\){}<>]/g, ' ');
+  // Collapse multiple spaces
+  t = t.replace(/\s{2,}/g, ' ');
+  return t;
+}
+
+function extractObfuscatedEmails(text) {
+  if (!text) return { emails: [], sample: [] };
+  let norm = normalizeForObfuscation(text);
+
+  // Replace obfuscation tokens with actual symbols
+  const obfuscatedSamples = [];
+  // Collect small samples before transform for debug
+  const atTokens = norm.match(OBFUSCATION_AT) || [];
+  const dotTokens = norm.match(OBFUSCATION_DOT) || [];
+  obfuscatedSamples.push(...atTokens.slice(0, MAX_OBFUSCATION_SAMPLE));
+  obfuscatedSamples.push(...dotTokens.slice(0, MAX_OBFUSCATION_SAMPLE));
+
+  norm = norm
+    .replace(OBFUSCATION_AT, '@')
+    .replace(OBFUSCATION_DOT, '.');
+
+  // Sometimes separators like "name . surname @ domain . com"
+  norm = norm.replace(/\s*\.\s*/g, '.');
+
+  // Remove spaces around '@' and '.'
+  norm = norm.replace(/\s*@\s*/g, '@').replace(/\s*\.\s*/g, '.');
+
+  // Now strict extraction
+  const emails = extractEmailsStrict(norm);
+  return { emails, sample: [...new Set(obfuscatedSamples)] };
 }
 
 function classifyEmails(emails, context = '', hrFocus = true) {
@@ -36,18 +112,17 @@ function classifyEmails(emails, context = '', hrFocus = true) {
   const hr = [];
   const general = [];
   emails.forEach(email => {
-    const lower = email.toLowerCase();
-    if (GENERIC_EXCLUDE_PREFIXES.some(p => lower.startsWith(p))) {
-      if (!hrFocus) general.push(lower);
+    if (GENERIC_EXCLUDE_PREFIXES.some(p => email.startsWith(p))) {
+      if (!hrFocus) general.push(email);
       return;
     }
-    const hasKeyword = HR_EMAIL_KEYWORDS.some(k => lower.includes(k));
-    const namePattern = /^[a-z]+\.[a-z]+@/i.test(lower);
+    const hasKeyword = HR_EMAIL_KEYWORDS.some(k => email.includes(k));
+    const namePattern = /^[a-z]+\.[a-z]+@/i.test(email);
     const contextHas = HR_EMAIL_KEYWORDS.some(k => ctx.includes(k));
     if (hasKeyword || (contextHas && (namePattern || hrFocus)) || (namePattern && hrFocus)) {
-      hr.push(lower);
+      hr.push(email);
     } else {
-      general.push(lower);
+      general.push(email);
     }
   });
   return {
@@ -83,24 +158,27 @@ function isLikelyHRPage(url, title) {
 
 async function fetchWithTimeout(url, opts = {}, timeoutMs = GLOBAL_TIMEOUT_MS) {
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       ...opts,
       headers: {
         'User-Agent': opts.userAgent ||
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
+        'Connection': 'keep-alive',
+        'Cookie': 'SRCHHPGUSR=SRCHLANG=en; MUID=0; _EDGE_S=1;',
         ...(opts.headers || {})
       },
       signal: controller.signal
     });
-    clearTimeout(id);
+    clearTimeout(timer);
     return res;
   } catch (e) {
-    clearTimeout(id);
+    clearTimeout(timer);
     throw e;
   }
 }
@@ -112,11 +190,7 @@ async function resolveBingRedirect(url) {
     if (!match) return url;
     let decoded = decodeURIComponent(match[1]);
     if (decoded.startsWith('a1') && !decoded.startsWith('http')) {
-      try {
-        decoded = Buffer.from(decoded.slice(2), 'base64').toString('utf-8');
-      } catch {
-        return url;
-      }
+      try { decoded = Buffer.from(decoded.slice(2), 'base64').toString('utf-8'); } catch {}
     }
     return decoded.startsWith('http') ? decoded : url;
   } catch {
@@ -126,37 +200,103 @@ async function resolveBingRedirect(url) {
 
 function isBlockedVariant(html) {
   const low = html.toLowerCase();
-  // No result containers + looks like search shell
   const noAlgo = !/b_algo/.test(low);
-  const maybeShell = /<!doctype html/.test(low) && /- Search<\/title>/.test(low);
-  // We treat missing b_algo + typical length as blocked variant
-  return noAlgo && maybeShell;
+  const hasMain = /<main\b/i.test(low) || /<div id="b_content"/i.test(low);
+  const hasTitleSearch = /- search<\/title>/i.test(low);
+  return noAlgo && (hasMain || hasTitleSearch);
 }
 
-/* DuckDuckGo fallback (HTML version) */
+function extractJsonUrls(html) {
+  const urls = new Set();
+  const regex = /"url":"https?:\\?\/\\?\/[^"]+?"/g;
+  const matches = html.match(regex) || [];
+  matches.forEach(m => {
+    let u = m.slice(7, -1).replace(/\\\//g, '/').replace(/\\\\/g, '\\');
+    if (u.startsWith('http') && !u.includes('bing.com')) urls.add(u);
+  });
+  return [...urls];
+}
+
 async function duckDuckGoFallback(query, maxLinks = 10, hrFocus = true) {
   const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query + ' email')}`;
-  const res = await fetchWithTimeout(url);
-  const html = await res.text();
+  const resp = await fetchWithTimeout(url);
+  const html = await resp.text();
   const $ = cheerio.load(html);
-  const links = [];
-  $('a.result__a').each((_, a) => {
-    const href = $(a).attr('href');
-    if (href && /^https?:\/\//.test(href)) links.push(href);
+  const linkSet = new Set();
+  const selectors = [
+    'a.result__a',
+    '.result__title a',
+    'div.result__body a.result__a',
+    'div.result a[href^="http"]'
+  ];
+  selectors.forEach(sel => {
+    $(sel).each((_, el) => {
+      const href = $(el).attr('href');
+      if (href && /^https?:\/\//.test(href)) linkSet.add(href);
+    });
   });
-  const snippetText = $('div.result__snippet, div.result__body').text();
-  const snippetEmails = extractEmails(snippetText);
-  const classifiedSnippet = classifyEmails(snippetEmails, snippetText, hrFocus);
+  const snippetText = $('div.result, div.result__body, body').text();
+  const snippetEmails = extractEmailsStrict(snippetText);
+  const classified = classifyEmails(snippetEmails, snippetText, hrFocus);
+  return {
+    links: [...linkSet].slice(0, maxLinks),
+    snippetHr: classified.hr,
+    snippetGeneral: classified.general
+  };
+}
+
+/* Clean & extract page text */
+function cleanAndExtractEmailsFromPage(html, hrFocus) {
+  const $ = cheerio.load(html);
+
+  // Remove noise
+  const REMOVE_SELECTORS = [
+    'script','style','noscript','iframe','svg','canvas','meta','link',
+    'header','footer','nav','aside','form','input','button','select','textarea',
+    '[role="banner"]','[role="navigation"]','[role="contentinfo"]','[aria-hidden="true"]'
+  ];
+  REMOVE_SELECTORS.forEach(sel => $(sel).remove());
+
+  // Remove large menus / repeated lists by heuristic (top nav)
+  $('ul,ol').each((_, el) => {
+    const text = $(el).text().trim();
+    if (text.length < 15) return;
+    const linkCount = $(el).find('a').length;
+    if (linkCount > 20 && text.length / (linkCount || 1) < 25) {
+      $(el).remove();
+    }
+  });
+
+  // Get body text
+  let text = $('body').text() || '';
+  text = decodeEntities(text);
+  // Collapse whitespace
+  text = text.replace(/\r/g, '').replace(/\t/g, ' ');
+  text = text.replace(/[ \u00A0]{2,}/g, ' ');
+  text = text.replace(/\n{3,}/g, '\n\n');
+  text = text.slice(0, PAGE_TEXT_CHAR_LIMIT);
+
+  // Strict pass
+  const strictEmails = extractEmailsStrict(text);
+
+  // Obfuscated pass (only if strict small or zero)
+  const obfuscated = extractObfuscatedEmails(text);
+  const all = new Set([...strictEmails, ...obfuscated.emails]);
+
+  // Classification on the union
+  const classified = classifyEmails([...all], text, hrFocus);
 
   return {
-    links: links.slice(0, maxLinks),
-    snippetHr: classifiedSnippet.hr,
-    snippetGeneral: classifiedSnippet.general
+    strictEmails,
+    obfuscatedEmails: obfuscated.emails,
+    obfuscationSampleTokens: obfuscated.sample,
+    classified,
+    cleanedTextChars: text.length
   };
 }
 
 /**
- * Core multi-query run with Bing + fallback.
+ * Main multi-query runner (Bing + fallbacks + cleaned page extraction)
  */
 async function runBingEmailHunt({
   query,
@@ -168,7 +308,6 @@ async function runBingEmailHunt({
   collectDebug = false
 }) {
   const queries = buildBingQueries(query, hrFocus, country).slice(0, maxQueries);
-
   const debug = collectDebug ? {
     queries,
     perQuery: [],
@@ -191,17 +330,16 @@ async function runBingEmailHunt({
   const allSearchUrls = [];
   let totalVisited = 0;
   let captchaTriggered = false;
-  let bingBlockedEveryQuery = true;
+  let everyQueryZeroLinks = true;
 
   for (let qi = 0; qi < queries.length; qi++) {
     if (globalUrlBudget !== undefined && totalVisited >= globalUrlBudget) break;
-
     const qStr = queries[qi];
-    if (qi > 0) await sleep(1000 + Math.random() * 600);
+    if (qi > 0) await sleep(900 + Math.random() * 500);
 
-    // Force static layout with extra params
-    const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(qStr)}&count=15&mkt=en-US&setlang=en-US&cc=US&ensearch=1&FORM=R5FD`;
+    const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(qStr)}&count=15&mkt=en-US&setlang=en-US&cc=US&ensearch=1&adlt=off&safeSearch=Off`;
     let html, serpStatus = null, serpError = null;
+
     try {
       const resp = await fetchWithTimeout(bingUrl);
       serpStatus = resp.status;
@@ -217,7 +355,7 @@ async function runBingEmailHunt({
       if (collectDebug) {
         debug.perQuery.push({
           index: qi + 1,
-          bingQuery: qStr,
+            bingQuery: qStr,
           serp: { status: serpStatus, error: serpError }
         });
       }
@@ -227,14 +365,11 @@ async function runBingEmailHunt({
     const low = html.toLowerCase();
     const captcha = low.includes('captcha') && html.includes('b_captcha');
     const blockedVariant = isBlockedVariant(html);
-
-    if (captcha) {
-      captchaTriggered = true;
-    }
+    if (captcha) captchaTriggered = true;
 
     const $ = cheerio.load(html);
     const bodyText = $('body').text();
-    const snippetEmails = extractEmails(bodyText);
+    const snippetEmails = extractEmailsStrict(bodyText);
     if (snippetEmails.length) {
       const classified = classifyEmails(snippetEmails, html, hrFocus);
       classified.hr.forEach(e => snippetHREmails.add(e));
@@ -246,7 +381,8 @@ async function runBingEmailHunt({
       '.b_algo h2 a',
       '#b_results li.b_algo h2 a',
       '#b_results h2 a',
-      '#b_results a[href^="http"]'
+      '#b_results a[href^="http"]',
+      'main a[href^="http"]'
     ];
     const linkSet = new Set();
     const selectorBreakdown = [];
@@ -254,20 +390,23 @@ async function runBingEmailHunt({
       const before = linkSet.size;
       $(sel).each((_, el) => {
         const href = $(el).attr('href');
-        if (href && /^https?:\/\//.test(href)) {
+        if (href && /^https?:\/\//.test(href) && !href.includes('bing.com')) {
           linkSet.add(href);
         }
       });
       selectorBreakdown.push({ selector: sel, added: linkSet.size - before, total: linkSet.size });
-      if (linkSet.size >= maxUrlsPerQuery * 2) break; // avoid over-collect
+      if (linkSet.size >= maxUrlsPerQuery * 3) break;
     }
-    const links = [...linkSet];
 
-    if (links.length > 0) bingBlockedEveryQuery = false;
-
-    if (collectDebug) {
-      debug.aggregate.totalLinksDiscovered += links.length;
+    let links = [...linkSet];
+    let jsonExtracted = [];
+    if (links.length === 0) {
+      jsonExtracted = extractJsonUrls(html);
+      if (jsonExtracted.length) links = jsonExtracted;
     }
+
+    if (links.length > 0) everyQueryZeroLinks = false;
+    if (collectDebug) debug.aggregate.totalLinksDiscovered += links.length;
 
     const queryDebug = collectDebug ? {
       index: qi + 1,
@@ -282,7 +421,8 @@ async function runBingEmailHunt({
         linksFound: links.length,
         firstLinks: links.slice(0, 5),
         selectorBreakdown,
-        htmlSample: html.slice(0, 350).replace(/\s+/g, ' ')
+        jsonExtractedLinksCount: jsonExtracted.length,
+        htmlSample: html.slice(0, 320).replace(/\s+/g, ' ')
       },
       pages: []
     } : null;
@@ -296,52 +436,64 @@ async function runBingEmailHunt({
       let pageErr = null;
       let hrAdded = 0;
       let generalAdded = 0;
-      let totalEmailsOnPage = 0;
+      let strictCount = 0;
+      let obfuscatedCount = 0;
 
       try {
         totalVisited++;
         const pageResp = await fetchWithTimeout(finalUrl);
         pageStatus = pageResp.status;
         if (!pageResp.ok) throw new Error(`HTTP ${pageResp.status}`);
+
         const pageHtml = await pageResp.text();
+        const extraction = cleanAndExtractEmailsFromPage(pageHtml, hrFocus);
+
+        strictCount = extraction.strictEmails.length;
+        obfuscatedCount = extraction.obfuscatedEmails.length;
+
+        // Merge classified results
+        extraction.classified.hr.forEach(e => pageHREmails.add(e));
+        extraction.classified.general.forEach(e => pageGeneralEmails.add(e));
+        hrAdded = extraction.classified.hr.length;
+        generalAdded = extraction.classified.general.length;
+
+        // mailto links (after classification to catch extras)
         const $$ = cheerio.load(pageHtml);
-        $$('script,style,noscript').remove();
-        const body = $$('body').text();
-        const title = $$('title').text().trim();
-        const pageEmails = extractEmails(body);
-        totalEmailsOnPage = pageEmails.length;
-        if (pageEmails.length) {
-          const classified = classifyEmails(pageEmails, body + ' ' + title, hrFocus);
-          hrAdded = classified.hr.length;
-          generalAdded = classified.general.length;
-          classified.hr.forEach(e => pageHREmails.add(e));
-            classified.general.forEach(e => pageGeneralEmails.add(e));
-        }
-        // mailto
         $$('a[href^="mailto:"]').each((_, a) => {
           const m = $$(a).attr('href');
           if (!m) return;
           const mail = m.replace(/^mailto:/i, '').split('?')[0].trim().toLowerCase();
-          if (mail && EMAIL_REGEX.test(mail)) {
-            const c2 = classifyEmails([mail], title, hrFocus);
-            c2.hr.forEach(e => pageHREmails.add(e));
-            c2.general.forEach(e => pageGeneralEmails.add(e));
-            hrAdded += c2.hr.length;
-            generalAdded += c2.general.length;
-            totalEmailsOnPage += c2.hr.length + c2.general.length;
+          if (mail && EMAIL_REGEX_STRICT.test(mail)) {
+            const c2 = classifyEmails([mail], '', hrFocus);
+            c2.hr.forEach(e => { if (!pageHREmails.has(e)) { pageHREmails.add(e); hrAdded += 1; } });
+            c2.general.forEach(e => { if (!pageGeneralEmails.has(e)) { pageGeneralEmails.add(e); generalAdded += 1; } });
           }
         });
 
         scrapedUrls.push({
           url: finalUrl,
           searchPage: qi + 1,
-          isHRPage: isLikelyHRPage(finalUrl, title),
+          isHRPage: isLikelyHRPage(finalUrl, ''), // title stripped; optional improvement
           emailCount: {
             hr: hrAdded,
             general: generalAdded,
             total: hrAdded + generalAdded
           }
         });
+
+        if (collectDebug && queryDebug) {
+          queryDebug.pages.push({
+            url: finalUrl,
+            status: pageStatus,
+            hrCount: hrAdded,
+            generalCount: generalAdded,
+            strictFound: strictCount,
+            obfuscatedFound: obfuscatedCount,
+            cleanedTextChars: extraction.cleanedTextChars,
+            obfuscationTokensSample: extraction.obfuscationSampleTokens.slice(0, 3)
+          });
+        }
+
         if (collectDebug) debug.aggregate.totalPagesFetched += 1;
       } catch (err) {
         pageErr = err.name === 'AbortError' ? 'timeout' : err.message;
@@ -351,48 +503,38 @@ async function runBingEmailHunt({
           searchPage: qi + 1,
           type: 'page'
         });
-        if (collectDebug) debug.aggregate.totalPageFetchErrors += 1;
-      }
-
-      if (collectDebug && queryDebug) {
-        queryDebug.pages.push({
-          url: finalUrl,
-          status: pageStatus,
-          hrCount: hrAdded,
-          generalCount: generalAdded,
-          totalEmails: totalEmailsOnPage,
-          error: pageErr || undefined
-        });
+        if (collectDebug) {
+          queryDebug && queryDebug.pages.push({
+            url: finalUrl,
+            status: pageStatus,
+            error: pageErr
+          });
+          debug.aggregate.totalPageFetchErrors += 1;
+        }
       }
     }
 
-    if (collectDebug && queryDebug) {
-      debug.perQuery.push(queryDebug);
-    }
-
+    if (collectDebug && queryDebug) debug.perQuery.push(queryDebug);
     if (captcha) break;
   }
 
-  // If ALL queries produced zero links, attempt fallback.
-  let fallbackUsed = false;
-  if (bingBlockedEveryQuery) {
+  if (everyQueryZeroLinks) {
     try {
       const fallback = await duckDuckGoFallback(query, maxUrlsPerQuery, hrFocus);
-      fallbackUsed = true;
       fallback.snippetHr.forEach(e => snippetHREmails.add(e));
       fallback.snippetGeneral.forEach(e => snippetGeneralEmails.add(e));
       if (collectDebug) {
         debug.fallback = {
           engine: 'duckduckgo',
-          linksTried: fallback.links,
+          reason: 'bing-zero-links',
+          linksFound: fallback.links.length,
           snippetHrFound: fallback.snippetHr.length,
           snippetGeneralFound: fallback.snippetGeneral.length
         };
       }
-      // (Optional) we could also fetch fallback.links pages here—keep minimal for now.
     } catch (e) {
       if (collectDebug) {
-        debug.fallback = { engine: 'duckduckgo', error: e.message };
+        debug.fallback = { engine: 'duckduckgo', reason: 'bing-zero-links', error: e.message };
       }
     }
   }
@@ -409,7 +551,7 @@ async function runBingEmailHunt({
     debug.aggregate.failedUrls = failedUrls.length;
     debug.aggregate.allSearchUrls = allSearchUrls.length;
     debug.aggregate.captchaTriggered = captchaTriggered;
-    debug.aggregate.fallbackUsed = fallbackUsed;
+    debug.aggregate.everyQueryZeroLinks = everyQueryZeroLinks;
   }
 
   return {
@@ -442,10 +584,7 @@ router.get('/search', async (req, res) => {
   } = req.query;
 
   if (!query) {
-    return res.status(400).json({
-      error: 'Missing parameter: query',
-      usage: '/api/scraping/search?query=term&urls=10&page=1&limit=20&country=morocco&hrFocus=true'
-    });
+    return res.status(400).json({ error: 'Missing parameter: query' });
   }
 
   const collectDebug = debug === '1' || debug === 'true';
@@ -460,7 +599,7 @@ router.get('/search', async (req, res) => {
       query,
       hrFocus: focus,
       country,
-      maxQueries: 3,
+      maxQueries: 2,
       maxUrlsPerQuery: urlCount,
       globalUrlBudget: urlCount,
       collectDebug
@@ -515,25 +654,25 @@ router.get('/search', async (req, res) => {
       },
       debug: collectDebug ? result.debug : undefined,
       note: collectDebug && ordered.length === 0
-        ? (result.debug?.aggregate?.fallbackUsed
-            ? 'NO_EMAILS_AFTER_FALLBACK'
-            : (result.debug?.aggregate?.totalLinksDiscovered === 0
-                ? 'NO_LINKS_EXTRACTED_POSSIBLE_BLOCK'
-                : 'NO_EMAILS_FOUND'))
+        ? (
+          result.debug?.aggregate?.everyQueryZeroLinks
+            ? 'NO_LINKS_EXTRACTED (BING SHELL / FALLBACK)'
+            : 'NO_EMAILS_FOUND_AFTER_CLEANING'
+        )
         : undefined
     });
 
   } catch (err) {
     console.error('SEARCH ERROR:', err);
-    return res.status(500).json({
+    res.status(500).json({
       error: 'Scraping failed',
       message: err.message || 'Unknown error',
-      debugHint: 'Add &debug=1 to inspect SERP parsing'
+      debugHint: 'Add &debug=1 to inspect.'
     });
   }
 });
 
-/* ---------- /search-all (multi) ---------- */
+/* ---------- /search-all (multi-page) ---------- */
 router.get('/search-all', async (req, res) => {
   const {
     query,
@@ -546,10 +685,7 @@ router.get('/search-all', async (req, res) => {
   } = req.query;
 
   if (!query) {
-    return res.status(400).json({
-      error: 'Missing parameter: query',
-      usage: '/api/scraping/search-all?query=term&maxPages=5&urlsPerPage=8&maxUrls=40&country=morocco&hrFocus=true'
-    });
+    return res.status(400).json({ error: 'Missing parameter: query' });
   }
 
   const collectDebug = debug === '1' || debug === 'true';
@@ -615,10 +751,7 @@ router.get('/search-all', async (req, res) => {
       },
       emails: ordered,
       breakdown: {
-        emailsByType: {
-          hr: result.hrEmails,
-          general: result.generalEmails
-        },
+        emailsByType: { hr: result.hrEmails, general: result.generalEmails },
         emailsBySearchPage: pages === 1 ? null : pageBreakdown,
         scrapedUrls: result.scrapedUrls,
         failedUrls: result.failedUrls,
@@ -626,20 +759,18 @@ router.get('/search-all', async (req, res) => {
       },
       debug: collectDebug ? result.debug : undefined,
       note: collectDebug && ordered.length === 0
-        ? (result.debug?.aggregate?.fallbackUsed
-            ? 'NO_EMAILS_AFTER_FALLBACK'
-            : (result.debug?.aggregate?.totalLinksDiscovered === 0
-                ? 'NO_LINKS_EXTRACTED_POSSIBLE_BLOCK'
-                : 'NO_EMAILS_FOUND'))
+        ? (result.debug?.aggregate?.everyQueryZeroLinks
+            ? 'NO_LINKS_EXTRACTED (BING SHELL / FALLBACK)'
+            : 'NO_EMAILS_FOUND_AFTER_CLEANING')
         : undefined
     });
 
   } catch (err) {
     console.error('SEARCH-ALL ERROR:', err);
-    return res.status(500).json({
+    res.status(500).json({
       error: 'Comprehensive scraping failed',
       message: err.message || 'Unknown error',
-      debugHint: 'Add &debug=1 to inspect SERP parsing'
+      debugHint: 'Add &debug=1 to inspect.'
     });
   }
 });
@@ -649,31 +780,10 @@ router.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
+    limits: { PAGE_TEXT_CHAR_LIMIT },
     endpoints: {
-      '/search': {
-        description: 'Single-page (paginated) Bing email scraping',
-        params: {
-          query: 'string (required)',
-          urls: 'int (1-20)',
-          page: 'int',
-          limit: 'int',
-          country: 'string',
-          hrFocus: 'true|false',
-          debug: 'true|1 optional'
-        }
-      },
-      '/search-all': {
-        description: 'Multi-page comprehensive Bing email scraping',
-        params: {
-          query: 'string (required)',
-          maxPages: 'int (1-10)',
-          urlsPerPage: 'int (1-20)',
-          maxUrls: 'int (1-100)',
-          country: 'string',
-          hrFocus: 'true|false',
-          debug: 'true|1 optional'
-        }
-      }
+      '/search': { params: ['query','urls','page','limit','country','hrFocus','debug'] },
+      '/search-all': { params: ['query','maxPages','urlsPerPage','maxUrls','country','hrFocus','debug'] }
     }
   });
 });
